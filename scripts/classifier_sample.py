@@ -5,11 +5,15 @@ process towards more realistic images.
 
 import argparse
 import os
+from PIL import Image
+import math
 
 import numpy as np
 import torch as th
 import torch.distributed as dist
 import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
 
 from guided_diffusion import dist_util, logger
 from guided_diffusion.script_util import (
@@ -22,6 +26,65 @@ from guided_diffusion.script_util import (
     args_to_dict,
 )
 
+def get_uniform_filter(kernel_size):
+    kernel = th.ones(1, 1, kernel_size, kernel_size)
+    kernel = kernel / (kernel_size * kernel_size)
+
+    # Reshape to 2d depthwise convolutional weight
+    kernel = kernel.view(1, kernel_size, kernel_size)
+    kernel = kernel.repeat(3, 1, 1, 1)
+    kernel = kernel.cuda()
+
+    return kernel
+
+def get_blur_filter(kernel_size):
+    """
+    Given kernel size, output the blur filter
+    """
+    # Set these to whatever you want for your gaussian filter
+    sigma = 5
+
+    # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
+    x_cord = th.arange(kernel_size)
+    x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
+    y_grid = x_grid.t()
+    xy_grid = th.stack([x_grid, y_grid], dim=-1)
+
+    mean = (kernel_size - 1)/2.
+    variance = sigma**2.
+
+    # Calculate the 2-dimensional gaussian kernel which is
+    # the product of two gaussian distributions for two different
+    # variables (in this case called x and y)
+    gaussian_kernel = (1./(2.*math.pi*variance)) *\
+                    th.exp(
+                        -th.sum((xy_grid - mean)**2., dim=-1) /\
+                        (2*variance)
+                    )
+    # Make sure sum of values in gaussian kernel equals 1.
+    gaussian_kernel = gaussian_kernel / th.sum(gaussian_kernel)
+
+    # Reshape to 2d depthwise convolutional weight
+    gaussian_kernel = gaussian_kernel.view(1, kernel_size, kernel_size)
+
+    # 3 = Num channels
+    gaussian_kernel = gaussian_kernel.repeat(3, 1, 1, 1)
+    gaussian_kernel = gaussian_kernel.cuda()
+
+    return gaussian_kernel
+
+def get_corrupted_image(image_path):
+    """
+    Given image path, load the data into a tensor 
+    """
+    # Define transformation
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+    # Load image
+    img = Image.open(image_path)
+    img_tensor = transform(img).to(dist_util.dev())
+    return img_tensor.unsqueeze(dim=0)
 
 def main():
     args = create_argparser().parse_args()
@@ -42,14 +105,22 @@ def main():
     model.eval()
 
     logger.log("loading classifier...")
+
     classifier = create_classifier(**args_to_dict(args, classifier_defaults().keys()))
-    classifier.load_state_dict(
-        dist_util.load_state_dict(args.classifier_path, map_location="cpu")
-    )
-    classifier.to(dist_util.dev())
-    if args.classifier_use_fp16:
-        classifier.convert_to_fp16()
-    classifier.eval()
+    # TODO: BRING BACK!
+    # classifier.load_state_dict(
+    #     dist_util.load_state_dict(args.classifier_path, map_location="cpu")
+    # )
+    # classifier.to(dist_util.dev())
+    # if args.classifier_use_fp16:
+    #     classifier.convert_to_fp16()
+    # classifier.eval()
+    classifier = None
+    
+
+    # Creating uniform blur kernel of size kernel size x kernel size
+    blur_kernel = get_uniform_filter(args.kernel_size)
+    corrupted_image = get_corrupted_image(args.image_path)
 
     def cond_fn(x, t, y=None):
         assert y is not None
@@ -82,9 +153,14 @@ def main():
             clip_denoised=args.clip_denoised,
             model_kwargs=model_kwargs,
             cond_fn=cond_fn,
+            adaptive_diffusion=True,
+            kernel=blur_kernel,
+            corrupted_image=corrupted_image,
             device=dist_util.dev(),
+            gradient_scaling=args.classifier_scale
         )
-        sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
+        sample = (sample * 255.0).clamp(0, 255).to(th.uint8)
+        # sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
         sample = sample.permute(0, 2, 3, 1)
         sample = sample.contiguous()
 
@@ -119,6 +195,8 @@ def create_argparser():
         model_path="",
         classifier_path="",
         classifier_scale=1.0,
+        kernel_size=5,
+        image_path=None
     )
     defaults.update(model_and_diffusion_defaults())
     defaults.update(classifier_defaults())

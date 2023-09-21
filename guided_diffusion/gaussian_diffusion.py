@@ -230,7 +230,8 @@ class GaussianDiffusion:
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(
-        self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None
+        self, model, x, t, clip_denoised=True, denoised_fn=None,
+        model_kwargs=None, blur_kernel=None, corrupted_image=None
     ):
         """
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
@@ -309,21 +310,44 @@ class GaussianDiffusion:
                 pred_xstart = process_xstart(
                     self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
                 )
+                pred_yt = process_xstart(
+                    self._predict_yt_from_eps(y=corrupted_image, t=t, A=blur_kernel, eps=model_output)
+                )
             model_mean, _, _ = self.q_posterior_mean_variance(
                 x_start=pred_xstart, x_t=x, t=t
             )
+            
         else:
             raise NotImplementedError(self.model_mean_type)
 
         assert (
             model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
         )
-        return {
+        return_dict = {
             "mean": model_mean,
             "variance": model_variance,
             "log_variance": model_log_variance,
             "pred_xstart": pred_xstart,
         }
+
+        if blur_kernel is not None:
+            return_dict["pred_yt"] = pred_yt
+        return return_dict
+
+    def convolve(self, blur_kernel, image):
+        channels, kernel_size = image.size() [1], blur_kernel.size() [2]
+
+        # Define the blur convolution function
+        blur = th.nn.Conv2d(in_channels=channels, out_channels=channels,
+                            kernel_size=kernel_size, groups=channels, bias=False,
+                            padding=kernel_size // 2, device=blur_kernel.device)
+        blur.weight.data = blur_kernel
+        blur.weight.requires_grad = False
+
+        # Convolve blur_kernel over image
+        output_image = blur(image)
+        
+        return output_image
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
@@ -332,6 +356,13 @@ class GaussianDiffusion:
             - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
         )
 
+    def _predict_yt_from_eps(self, y, t, A, eps):
+        assert y.shape == eps.shape
+        A_eps_convolve = self.convolve(A, eps)
+        return (
+            _extract_into_tensor(self.sqrt_alphas_cumprod, t, y.shape) * y
+            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, y.shape) * A_eps_convolve
+        )
     def _predict_xstart_from_xprev(self, x_t, t, xprev):
         assert x_t.shape == xprev.shape
         return (  # (xprev - coef2*x_t) / coef1
@@ -353,7 +384,8 @@ class GaussianDiffusion:
             return t.float() * (1000.0 / self.num_timesteps)
         return t
 
-    def condition_mean(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
+    def condition_mean(self, cond_fn, p_mean_var, x, t, model_kwargs=None,
+                       y_t=None, blur_kernel=None, gradient_scaling=0):
         """
         Compute the mean for the previous step, given a function cond_fn that
         computes the gradient of a conditional log probability with respect to
@@ -362,7 +394,19 @@ class GaussianDiffusion:
 
         This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
         """
-        gradient = cond_fn(x, self._scale_timesteps(t), **model_kwargs)
+        if blur_kernel is None:
+            gradient = cond_fn(x, self._scale_timesteps(t), **model_kwargs)
+        else:
+            kernel_mu_convolve = self.convolve(blur_kernel, p_mean_var["mean"])
+            kernel_mu_convolve = kernel_mu_convolve - y_t
+
+            # Transpose for cross correlation
+            kernel_tranpose = blur_kernel.transpose(2, 3)
+
+            # Analytical gradient
+            gradient = -2 * (self.convolve(kernel_tranpose, kernel_mu_convolve))
+            gradient = gradient * gradient_scaling
+
         new_mean = (
             p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float()
         )
@@ -401,6 +445,9 @@ class GaussianDiffusion:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
+        blur_kernel=None,
+        corrupted_image=None,
+        gradient_scaling=0
     ):
         """
         Sample x_{t-1} from the model at the given timestep.
@@ -426,6 +473,8 @@ class GaussianDiffusion:
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
+            blur_kernel=blur_kernel,
+            corrupted_image=corrupted_image,
         )
         noise = th.randn_like(x)
         nonzero_mask = (
@@ -433,7 +482,9 @@ class GaussianDiffusion:
         )  # no noise when t == 0
         if cond_fn is not None:
             out["mean"] = self.condition_mean(
-                cond_fn, out, x, t, model_kwargs=model_kwargs
+                cond_fn, out, x, t, model_kwargs=model_kwargs,
+                y_t=out["pred_yt"], blur_kernel=blur_kernel,
+                gradient_scaling=gradient_scaling
             )
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
@@ -449,6 +500,10 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         progress=False,
+        adaptive_diffusion=False,
+        kernel=None,
+        corrupted_image=None,
+        gradient_scaling=0
     ):
         """
         Generate samples from the model.
@@ -469,6 +524,10 @@ class GaussianDiffusion:
         :param progress: if True, show a tqdm progress bar.
         :return: a non-differentiable batch of samples.
         """
+        if adaptive_diffusion:
+            assert kernel is not None, "Need kernel for adaptive diffusion"
+            assert corrupted_image is not None, "Need image for adaptive diffusion"
+
         final = None
         for sample in self.p_sample_loop_progressive(
             model,
@@ -480,6 +539,9 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
             device=device,
             progress=progress,
+            blur_kernel=kernel,
+            corrupted_image=corrupted_image,
+            gradient_scaling=gradient_scaling
         ):
             final = sample
         return final["sample"]
@@ -495,6 +557,9 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         progress=False,
+        blur_kernel=None,
+        corrupted_image=None,
+        gradient_scaling=0
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -530,6 +595,9 @@ class GaussianDiffusion:
                     denoised_fn=denoised_fn,
                     cond_fn=cond_fn,
                     model_kwargs=model_kwargs,
+                    blur_kernel=blur_kernel,
+                    corrupted_image=corrupted_image,
+                    gradient_scaling=gradient_scaling
                 )
                 yield out
                 img = out["sample"]
