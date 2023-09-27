@@ -164,3 +164,4 @@ models/*
 mid_logs/
 *.jpg
 gradient_logs/
+*.npz

@@ -310,8 +310,15 @@ class GaussianDiffusion:
                 pred_xstart = process_xstart(
                     self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
                 )
+                pred_At, gradient_At = self._predict_At_from_y(
+                    y=corrupted_image, t=t, x=x, A=blur_kernel,
+                    eps=model_output
+                )
+
                 pred_yt = process_xstart(
-                    self._predict_yt_from_eps(y=corrupted_image, t=t, A=blur_kernel, eps=model_output)
+                    # TODO: Check if predicted A_t or blur_kernel
+                    self._predict_yt_from_eps(y=corrupted_image, t=t,
+                                              A=pred_At, eps=model_output)
                 )
             model_mean, _, _ = self.q_posterior_mean_variance(
                 x_start=pred_xstart, x_t=x, t=t
@@ -332,22 +339,25 @@ class GaussianDiffusion:
 
         if blur_kernel is not None:
             return_dict["pred_yt"] = pred_yt
+            return_dict["pred_At"] = pred_At
+            return_dict["gradient_At"] = gradient_At
         return return_dict
 
-    def convolve(self, blur_kernel, image):
-        channels, kernel_size = image.size() [1], blur_kernel.size() [2]
+    def convolve(self, blur_kernel, image, set_gradient=False):
+        with th.enable_grad():
+            channels, kernel_size = image.size() [1], blur_kernel.size() [2]
 
-        # Define the blur convolution function
-        blur = th.nn.Conv2d(in_channels=channels, out_channels=channels,
+            # Define the blur convolution function
+            blur = th.nn.Conv2d(in_channels=channels, out_channels=channels,
                             kernel_size=kernel_size, groups=channels, bias=False,
                             padding=kernel_size // 2, device=blur_kernel.device)
-        blur.weight.data = blur_kernel
-        blur.weight.requires_grad = False
+            blur.weight.data = blur_kernel
+            blur.weight.requires_grad = set_gradient
 
-        # Convolve blur_kernel over image
-        output_image = blur(image)
-        
-        return output_image
+            # Convolve blur_kernel over image
+            output_image = blur(image)
+            
+            return output_image
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
@@ -363,6 +373,68 @@ class GaussianDiffusion:
             _extract_into_tensor(self.sqrt_alphas_cumprod, t, y.shape) * y
             + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, y.shape) * A_eps_convolve
         )
+
+    def blur_log_likelihood(self, y, t, x, kernel, eps):
+        with th.enable_grad():
+            # Convolution outputs
+            A_x_convolve = kernel(x)
+            A_eps_convolve = kernel(eps)
+
+            # Intermediate values
+            alphas_cumprod_y = _extract_into_tensor(self.sqrt_alphas_cumprod, t, y.shape) * y
+            one_minus_alphas_cumprod_A_eps = _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, y.shape) * A_eps_convolve
+            y_t = alphas_cumprod_y + one_minus_alphas_cumprod_A_eps
+
+            # Compute likelihood
+            probability = - th.norm(A_x_convolve - y_t) ** 2
+
+            return probability
+
+    def _predict_At_from_y(self, y, t, x, A, eps, eta=4e-3, n_steps=100,
+                           lambda_=1e-2, clip_value=1.5, verbose=False):
+        with th.enable_grad():
+            assert y.shape == x.shape
+
+            channels, kernel_size = x.size() [1], A.size() [2]
+            blur_kernel_A = th.nn.Conv2d(in_channels=channels, out_channels=channels,
+                                         kernel_size=kernel_size, groups=channels, bias=False,
+                                         padding=kernel_size // 2, device=A.device)
+
+            A_copy = A.data.detach().clone()
+            blur_kernel_A.weight.data = A.data
+            blur_kernel_A.weight.requires_grad = True
+
+            # TODO: Tune other adam variables
+            optimizer_A = th.optim.Adam(list(blur_kernel_A.parameters()), lr=eta, weight_decay=lambda_)
+
+            # Optimize A
+            loss_values = []
+
+            for i in range(n_steps):
+                # Minimize negative log likelihood of y | A_t
+                loss = self.blur_log_likelihood(y, t, x, blur_kernel_A, eps)
+                loss_values.append(loss.item())
+                if verbose:
+                    print(f"Timestep #{t}, log likelihood: {loss}")
+                (-loss).backward()
+
+                # Clip gradients
+                th.nn.utils.clip_grad_value_(blur_kernel_A.parameters(), clip_value=clip_value)
+
+                # Perform gradient descent
+                optimizer_A.step()
+                optimizer_A.zero_grad()
+
+            print(f"Timestep #{t}, average log likelihood: {np.mean(loss_values)}")
+            # Compute gradient wrt A_t (required for guidance)
+            gradient_At = th.autograd.grad(self.blur_log_likelihood(y, t, x, blur_kernel_A, eps), blur_kernel_A.weight) [0]
+            gradient_At = th.clamp(gradient_At, min=-clip_value, max=clip_value)
+
+            # A is detached from computational graph
+            A_optim = blur_kernel_A.weight.data.clone()
+
+            return A_optim.detach(), gradient_At.detach()
+
     def _predict_xstart_from_xprev(self, x_t, t, xprev):
         assert x_t.shape == xprev.shape
         return (  # (xprev - coef2*x_t) / coef1
@@ -385,7 +457,8 @@ class GaussianDiffusion:
         return t
 
     def condition_mean(self, cond_fn, p_mean_var, x, t, model_kwargs=None,
-                       y_t=None, blur_kernel=None, gradient_scaling=0):
+                       y_t=None, blur_kernel=None, gradient_At=None,
+                       gradient_scaling=0):
         """
         Compute the mean for the previous step, given a function cond_fn that
         computes the gradient of a conditional log probability with respect to
@@ -403,9 +476,11 @@ class GaussianDiffusion:
             # Transpose for cross correlation
             kernel_tranpose = blur_kernel.transpose(2, 3)
 
-            # Analytical gradient
-            gradient = -2 * (self.convolve(kernel_tranpose, kernel_mu_convolve))
-            gradient = gradient * gradient_scaling
+            # Analytical gradient wrt x_t
+            gradient_xt = -2 * (self.convolve(kernel_tranpose, kernel_mu_convolve))
+
+            # TODO: scale gradient_At
+            gradient = gradient_xt * gradient_scaling
 
         new_mean = (
             p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float()
@@ -483,8 +558,8 @@ class GaussianDiffusion:
         if cond_fn is not None:
             out["mean"] = self.condition_mean(
                 cond_fn, out, x, t, model_kwargs=model_kwargs,
-                y_t=out["pred_yt"], blur_kernel=blur_kernel,
-                gradient_scaling=gradient_scaling
+                y_t=out["pred_yt"], blur_kernel=out["pred_At"],
+                gradient_At=out["gradient_At"], gradient_scaling=gradient_scaling
             )
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}

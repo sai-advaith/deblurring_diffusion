@@ -10,6 +10,14 @@
             "justMyCode": false,
         },
         {
+            "name": "gradient_test",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/test_gradient.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+        },
+        {
             // /Users/advaithsai/denoising_diffusion/scripts/classifier_sample.py
             "name": "sample_guided_diffusion",
             "type": "python",

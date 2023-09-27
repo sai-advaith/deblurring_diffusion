@@ -26,12 +26,21 @@ from guided_diffusion.script_util import (
     args_to_dict,
 )
 
+def init_blur_kernel(kernel_size):
+    kernel_shape = (1, kernel_size, kernel_size)
+    kernel = th.normal(mean=0.0, std=1.0, size=kernel_shape)
+
+    # Reshape to 2d depthwise convolutional weight
+    kernel = kernel.repeat(3, 1, 1, 1)
+    kernel = kernel.cuda()
+
+    return kernel
+
 def get_uniform_filter(kernel_size):
-    kernel = th.ones(1, 1, kernel_size, kernel_size)
+    kernel = th.ones(1, kernel_size, kernel_size)
     kernel = kernel / (kernel_size * kernel_size)
 
     # Reshape to 2d depthwise convolutional weight
-    kernel = kernel.view(1, kernel_size, kernel_size)
     kernel = kernel.repeat(3, 1, 1, 1)
     kernel = kernel.cuda()
 
@@ -119,8 +128,8 @@ def main():
     
 
     # Creating uniform blur kernel of size kernel size x kernel size
-    blur_kernel = get_uniform_filter(args.kernel_size)
     corrupted_image = get_corrupted_image(args.image_path)
+    blur_kernel = init_blur_kernel(args.kernel_size)
 
     def cond_fn(x, t, y=None):
         assert y is not None
