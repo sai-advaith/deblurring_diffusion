@@ -51,7 +51,7 @@ def get_blur_filter(kernel_size):
     Given kernel size, output the blur filter
     """
     # Set these to whatever you want for your gaussian filter
-    sigma = 5
+    sigma = 20
 
     # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
     x_cord = th.arange(kernel_size)
@@ -93,6 +93,7 @@ def get_corrupted_image(image_path):
     # Load image
     img = Image.open(image_path)
     img_tensor = transform(img).to(dist_util.dev())
+    img_tensor = (img_tensor * 2) - 1
     return img_tensor.unsqueeze(dim=0)
 
 def main():
@@ -116,20 +117,19 @@ def main():
     logger.log("loading classifier...")
 
     classifier = create_classifier(**args_to_dict(args, classifier_defaults().keys()))
-    # TODO: BRING BACK!
-    # classifier.load_state_dict(
-    #     dist_util.load_state_dict(args.classifier_path, map_location="cpu")
-    # )
-    # classifier.to(dist_util.dev())
-    # if args.classifier_use_fp16:
-    #     classifier.convert_to_fp16()
-    # classifier.eval()
-    classifier = None
-    
+    # TODO: Adjust according to Table 12
+    classifier.load_state_dict(
+        dist_util.load_state_dict(args.classifier_path, map_location="cpu")
+    )
+    classifier.to(dist_util.dev())
+    if args.classifier_use_fp16:
+        classifier.convert_to_fp16()
+    classifier.eval()
+    logger.log("classifer loaded")
 
     # Creating uniform blur kernel of size kernel size x kernel size
     corrupted_image = get_corrupted_image(args.image_path)
-    blur_kernel = init_blur_kernel(args.kernel_size)
+    blur_kernel = get_blur_filter(args.kernel_size)
 
     def cond_fn(x, t, y=None):
         assert y is not None
@@ -168,8 +168,7 @@ def main():
             device=dist_util.dev(),
             gradient_scaling=args.classifier_scale
         )
-        sample = (sample * 255.0).clamp(0, 255).to(th.uint8)
-        # sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
+        sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
         sample = sample.permute(0, 2, 3, 1)
         sample = sample.contiguous()
 
