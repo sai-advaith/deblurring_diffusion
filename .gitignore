@@ -165,3 +165,5 @@ mid_logs/
 *.jpg
 gradient_logs/
 *.npz
+imgs/
+output.txt

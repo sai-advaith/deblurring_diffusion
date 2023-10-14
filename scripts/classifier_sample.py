@@ -46,7 +46,7 @@ def get_uniform_filter(kernel_size):
 
     return kernel
 
-def get_blur_filter(kernel_size):
+def get_gaussian_filter(kernel_size):
     """
     Given kernel size, output the blur filter
     """
@@ -129,7 +129,7 @@ def main():
 
     # Creating uniform blur kernel of size kernel size x kernel size
     corrupted_image = get_corrupted_image(args.image_path)
-    blur_kernel = get_blur_filter(args.kernel_size)
+    blur_kernel = get_uniform_filter(args.kernel_size)
 
     def cond_fn(x, t, y=None):
         assert y is not None
