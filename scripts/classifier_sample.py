@@ -9,6 +9,7 @@ from PIL import Image
 import math
 
 import numpy as np
+import matplotlib.pyplot as plt
 import torch as th
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -26,13 +27,21 @@ from guided_diffusion.script_util import (
     args_to_dict,
 )
 
-def init_blur_kernel(kernel_size):
-    kernel_shape = (1, kernel_size, kernel_size)
-    kernel = th.normal(mean=0.0, std=1.0, size=kernel_shape)
+def init_blur_kernel(kernel_size, timesteps, std):
+    """
+    Initialize with a smooth / uniform operator
+    """
+    kernel_uniform = get_uniform_filter(kernel_size)
+    kernel = kernel_uniform + th.randn_like(kernel_uniform) * std
+    print(kernel)
 
-    # Reshape to 2d depthwise convolutional weight
-    kernel = kernel.repeat(3, 1, 1, 1)
-    kernel = kernel.cuda()
+    cosine_similarity = th.nn.CosineSimilarity(dim=0, eps=1e-6)
+    cosine_kernels = cosine_similarity(kernel, kernel_uniform)
+
+    plt.imshow(cosine_kernels.cpu().numpy()[0], cmap='viridis', interpolation='nearest')
+    plt.colorbar()
+    plt.savefig(f'imgs/cosine_similarity_kernels/cosine_similarity_kernels_{timesteps}.jpg')
+    plt.close()
 
     return kernel
 
@@ -129,7 +138,7 @@ def main():
 
     # Creating uniform blur kernel of size kernel size x kernel size
     corrupted_image = get_corrupted_image(args.image_path)
-    blur_kernel = get_uniform_filter(args.kernel_size)
+    blur_kernel = init_blur_kernel(args.kernel_size, args.diffusion_steps, 0.05)
 
     def cond_fn(x, t, y=None):
         assert y is not None
@@ -166,7 +175,8 @@ def main():
             kernel=blur_kernel,
             corrupted_image=corrupted_image,
             device=dist_util.dev(),
-            gradient_scaling=args.classifier_scale
+            gradient_scaling=args.classifier_scale,
+            wandb_log=False
         )
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
         sample = sample.permute(0, 2, 3, 1)

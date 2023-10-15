@@ -60,7 +60,7 @@ def uniform_blur_filter(input_image, kernel_size):
 def gaussian_blur_filter(input_image, kernel_size, sigma):
     # Set these to whatever you want for your gaussian filter
     kernel_size = 5
-    sigma = 20
+    sigma = 25
 
     # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
     x_cord = torch.arange(kernel_size)
@@ -89,6 +89,7 @@ def gaussian_blur_filter(input_image, kernel_size, sigma):
     gaussian_kernel = gaussian_kernel.repeat(channels, 1, 1, 1)
     gaussian_kernel = gaussian_kernel.cuda()
     print(gaussian_kernel)
+    print(gaussian_kernel.size())
 
     gaussian_filter = torch.nn.Conv2d(in_channels=channels, out_channels=channels,
                                       kernel_size=kernel_size, groups=channels, bias=False,
@@ -106,6 +107,7 @@ def gaussian_blur_filter(input_image, kernel_size, sigma):
     output_image = output_image.clamp(0, 255).to(torch.uint8)
 
     output_image = output_image / 255
+    print(output_image.size())
     return output_image
 
 def batch_process(batch_path, blur_function, positional_arguments):
@@ -153,12 +155,13 @@ if args.gaussian:
         noisy_tensor = batch_process(args.batch_path, gaussian_blur_filter, [kernel_size, args.sigma])
     else:
         noisy_tensor = gaussian_blur_filter(img_tensor, kernel_size, args.sigma)
+        noisy_tensor = noisy_tensor.unsqueeze(dim=0)
 if args.uniform:
     if args.batch:
         noisy_tensor = batch_process(args.batch_path, uniform_blur_filter, [kernel_size])
     else:
         noisy_tensor = uniform_blur_filter(img_tensor, kernel_size)
-
+        noisy_tensor = noisy_tensor.unsqueeze(dim=0)
 print(noisy_tensor.size())
 noisy_tensor = noisy_tensor.permute(0, 2, 3, 1)
 noisy_tensor = noisy_tensor.cpu().numpy() * 255

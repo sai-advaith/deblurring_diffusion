@@ -167,3 +167,4 @@ gradient_logs/
 *.npz
 imgs/
 output.txt
+wandb/

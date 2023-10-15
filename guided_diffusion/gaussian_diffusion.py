@@ -10,6 +10,8 @@ import math
 
 import numpy as np
 import torch as th
+import matplotlib.pyplot as plt
+import wandb
 
 from .nn import mean_flat
 from .losses import normal_kl, discretized_gaussian_log_likelihood
@@ -229,9 +231,22 @@ class GaussianDiffusion:
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
+    def psnr(self, xstart, At, corrupted_image):
+        def process_img(img):
+            img = ((img + 1) * 127.5).clamp(0, 255).to(th.uint8)
+            img = img.permute(0, 2, 3, 1)
+            return img
+        # PSNR
+        img1_tensor = process_img(self.convolve(At, xstart))
+        img2_tensor = process_img(corrupted_image)
+        mse = th.mean((img1_tensor - img2_tensor) ** 2 + 1e-9, dtype=th.float32)
+        psnr = 20 * th.log10(255.0 / th.sqrt(mse))
+
+        return psnr
+
     def p_mean_variance(
         self, model, x, t, clip_denoised=True, denoised_fn=None,
-        model_kwargs=None, blur_kernel=None, corrupted_image=None
+        model_kwargs=None, blur_kernel=None, corrupted_image=None, wandb_log=True
     ):
         """
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
@@ -323,23 +338,21 @@ class GaussianDiffusion:
                     self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
                 )
                 if blur_kernel is not None:
-                    # pred_At, gradient_At = self._predict_At_from_y(
-                    #     y=corrupted_image, t=t, x_t=x, A=blur_kernel,
-                    #     eps=model_output
-                    # )
-                    # pred_At = process_kernel(pred_At)
-                    pred_At, gradient_At = None, None
+                    pred_At, gradient_At = self._predict_At_from_y(
+                        y=corrupted_image, t=t, x_t=x, A=blur_kernel,
+                        eps=model_output, wandb_log=wandb_log
+                    )
+                    pred_At = process_kernel(pred_At)
 
                     pred_yt = process_xstart(
                         # TODO: Check if predicted A_t or blur_kernel
                         self._predict_yt_from_eps(y=corrupted_image, t=t,
-                                                A=blur_kernel, eps=model_output)
+                                                A=pred_At, eps=model_output)
                     )
 
             model_mean, _, _ = self.q_posterior_mean_variance(
                 x_start=pred_xstart, x_t=x, t=t
             )
-            
         else:
             raise NotImplementedError(self.model_mean_type)
 
@@ -407,15 +420,16 @@ class GaussianDiffusion:
             log_probability = - th.norm(A_x_convolve - y_t) ** 2
             return log_probability
 
-    def _predict_At_from_y(self, y, t, x_t, A, eps, eta=4e-3, n_steps=100,
-                           lambda_=1e-2, clip_value=1.5, verbose=False):
+    def _predict_At_from_y(self, y, t, x_t, A, eps, eta=4e-3, n_steps=200,
+                           lambda_=1e-2, clip_value=1.5, verbose=False, wandb_log=True):
         with th.enable_grad():
             assert y.shape == x_t.shape
 
             channels, kernel_size = x_t.size() [1], A.size() [2]
             blur_kernel_A = th.nn.Conv2d(in_channels=channels, out_channels=channels,
                                          kernel_size=kernel_size, groups=channels, bias=False,
-                                         padding=kernel_size // 2, device=A.device)
+                                         padding=kernel_size // 2, device=A.device,
+                                         padding_mode='reflect')
 
             # A_copy = A.data.detach().clone()
             blur_kernel_A.weight.data = A.data
@@ -441,6 +455,8 @@ class GaussianDiffusion:
                 # Perform gradient descent
                 optimizer_A.step()
                 optimizer_A.zero_grad()
+            if wandb_log:
+                wandb.log({"Timestep": t.item(), "Average Likelihood": np.mean(loss_values)})
             print(f"Timestep #{t}, average likelihood: {np.mean(loss_values)}")
 
             # Compute gradient wrt A_t (required for guidance)
@@ -528,6 +544,41 @@ class GaussianDiffusion:
         )
         return out
 
+    def get_gaussian_filter(self, kernel_size):
+        """
+        Given kernel size, output the blur filter
+        """
+        # Set these to whatever you want for your gaussian filter
+        sigma = 25
+
+        # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
+        x_cord = th.arange(kernel_size)
+        x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
+        y_grid = x_grid.t()
+        xy_grid = th.stack([x_grid, y_grid], dim=-1)
+
+        mean = (kernel_size - 1)/2.
+        variance = sigma**2.
+
+        # Calculate the 2-dimensional gaussian kernel which is
+        # the product of two gaussian distributions for two different
+        # variables (in this case called x and y)
+        gaussian_kernel = (1./(2.*math.pi*variance)) *\
+                        th.exp(
+                            -th.sum((xy_grid - mean)**2., dim=-1) /\
+                            (2*variance)
+                        )
+        # Make sure sum of values in gaussian kernel equals 1.
+        gaussian_kernel = gaussian_kernel / th.sum(gaussian_kernel)
+
+        # Reshape to 2d depthwise convolutional weight
+        gaussian_kernel = gaussian_kernel.view(1, kernel_size, kernel_size)
+
+        # 3 = Num channels
+        gaussian_kernel = gaussian_kernel.repeat(3, 1, 1, 1)
+        gaussian_kernel = gaussian_kernel.cuda()
+
+        return gaussian_kernel
     def p_sample(
         self,
         model,
@@ -539,7 +590,8 @@ class GaussianDiffusion:
         model_kwargs=None,
         blur_kernel=None,
         corrupted_image=None,
-        gradient_scaling=0
+        gradient_scaling=0,
+        wandb_log=True
     ):
         """
         Sample x_{t-1} from the model at the given timestep.
@@ -567,6 +619,7 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
             blur_kernel=blur_kernel,
             corrupted_image=corrupted_image,
+            wandb_log=wandb_log
         )
         noise = th.randn_like(x)
         nonzero_mask = (
@@ -574,14 +627,9 @@ class GaussianDiffusion:
         )  # no noise when t == 0
         if cond_fn is not None:
             if blur_kernel is not None:
-                # out["mean"] = self.condition_mean(
-                #     cond_fn, out, x, t, model_kwargs=model_kwargs,
-                #     y_t=out["pred_yt"], blur_kernel=out["pred_At"],
-                #     gradient_At=out["gradient_At"], gradient_scaling=gradient_scaling
-                # )
                 out["mean"] = self.condition_mean(
                     cond_fn, out, x, t, model_kwargs=model_kwargs,
-                    y_t=out["pred_yt"], blur_kernel=blur_kernel,
+                    y_t=out["pred_yt"], blur_kernel=out["pred_At"],
                     gradient_At=out["gradient_At"], gradient_scaling=gradient_scaling
                 )
             else:
@@ -589,6 +637,55 @@ class GaussianDiffusion:
                     cond_fn, out, x, t, model_kwargs=model_kwargs
                 )
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+
+        if wandb_log:
+            # TODO Modify for Gaussian case
+            kernel_size = out["pred_At"].size() [-1]
+            ground_truth_kernel = self.get_gaussian_filter(kernel_size)
+            # ground_truth_kernel = th.ones(1, kernel_size, kernel_size)
+            # ground_truth_kernel = ground_truth_kernel / (kernel_size * kernel_size)
+            # ground_truth_kernel = ground_truth_kernel.repeat(3, 1, 1, 1)
+            # ground_truth_kernel = ground_truth_kernel.cuda()
+
+            psnr_val = self.psnr(out["pred_xstart"], out["pred_At"], corrupted_image)
+            cosine_similarity = th.nn.CosineSimilarity(dim=0, eps=1e-6)
+            cosine_kernels = cosine_similarity(out["pred_At"], ground_truth_kernel)
+
+            wandb.log({"PSNR X start vs Observation": psnr_val,
+                    "Mean cosine similarity": th.mean(cosine_kernels)})
+
+        if t % 100 == 0:
+            from PIL import Image
+            mu = ((out["mean"] + 1) * 127.5).clamp(0, 255).to(th.uint8)
+            mu = mu.permute(0,2,3,1)
+            x_prev = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
+            x_prev = x_prev.permute(0, 2, 3, 1)
+
+            im = Image.fromarray(mu[0].cpu().numpy())
+            im.save(f"imgs/means/mean_long_{t.item()}.jpg")
+
+            im2 = Image.fromarray(x_prev[0].cpu().numpy())
+            im2.save(f"imgs/samples/sample_long_{t.item()}.jpg")
+
+            # kernel_r = out["pred_At"][0, 0, :, :].cpu().numpy()
+            # kernel_g = out["pred_At"][1, 0, :, :].cpu().numpy()
+            # kernel_b = out["pred_At"][2, 0, :, :].cpu().numpy()
+            if wandb_log:
+                plt.imshow(cosine_kernels.cpu().numpy()[0], cmap='viridis', interpolation='nearest')
+                plt.colorbar()
+                plt.savefig(f'imgs/cosine_similarity_kernels/cosine_similarity_kernels_{t.item()}.jpg')
+                plt.close()
+                print(out["pred_At"])
+
+                wandb.log({f"mean_log_{t.item()}": wandb.Image(im, caption="Diffusion Model mean for Timestep"),
+                        f"sample_log_{t.item()}": wandb.Image(im2, caption="Sample for Timestep")})
+
+            # wandb.log({f"mean_log_{t.item()}": wandb.Image(im, caption="Diffusion Model mean for Timestep"),
+            #            f"sample_log_{t.item()}": wandb.Image(im2, caption="Sample for Timestep"),
+            #            f"blur_kernel_log_{t.item()}": wandb.Histogram(kernel_r),
+            #            f"blur_kernel_log_{t.item()}": wandb.Histogram(kernel_g),
+            #            f"blur_kernel_log_{t.item()}": wandb.Histogram(kernel_b)})
+
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
     def p_sample_loop(
@@ -605,7 +702,8 @@ class GaussianDiffusion:
         adaptive_diffusion=False,
         kernel=None,
         corrupted_image=None,
-        gradient_scaling=0
+        gradient_scaling=0,
+        wandb_log=True
     ):
         """
         Generate samples from the model.
@@ -631,6 +729,25 @@ class GaussianDiffusion:
             assert corrupted_image is not None, "Need image for adaptive diffusion"
 
         final = None
+
+        if wandb_log:
+            WANDB_USER_NAME="sai-advaith"
+            WANDB_PROJECT_NAME="deblur_diffusion"
+            WANDB_RUN_NAME = "gaussian_blur_kernel_estimation_epochs_200_kernel_0_perturb_init"
+
+            print(WANDB_RUN_NAME)
+
+            wandb.init(project=WANDB_PROJECT_NAME, entity=WANDB_USER_NAME,
+                       name=WANDB_RUN_NAME,
+                       config={
+                           "lambda": 1e-2,
+                           "eta": 4e-3,
+                           "A_optimize_steps": 200,
+                           "clip_value": 1.5,
+                           "perturb": 0,
+                           "diffusion_steps": self.num_timesteps
+                       })
+
         for sample in self.p_sample_loop_progressive(
             model,
             shape,
@@ -643,9 +760,11 @@ class GaussianDiffusion:
             progress=progress,
             blur_kernel=kernel,
             corrupted_image=corrupted_image,
-            gradient_scaling=gradient_scaling
+            gradient_scaling=gradient_scaling,
+            wandb_log=wandb_log
         ):
             final = sample
+        wandb.finish()
         return final["sample"]
 
     def p_sample_loop_progressive(
@@ -661,7 +780,8 @@ class GaussianDiffusion:
         progress=False,
         blur_kernel=None,
         corrupted_image=None,
-        gradient_scaling=0
+        gradient_scaling=0,
+        wandb_log=True
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -699,7 +819,8 @@ class GaussianDiffusion:
                     model_kwargs=model_kwargs,
                     blur_kernel=blur_kernel,
                     corrupted_image=corrupted_image,
-                    gradient_scaling=gradient_scaling
+                    gradient_scaling=gradient_scaling,
+                    wandb_log=wandb_log
                 )
                 yield out
                 img = out["sample"]
