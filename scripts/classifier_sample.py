@@ -178,6 +178,7 @@ def main():
             gradient_scaling=args.classifier_scale,
             wandb_log=False
         )
+        # Back to [0, 255] range
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
         sample = sample.permute(0, 2, 3, 1)
         sample = sample.contiguous()
