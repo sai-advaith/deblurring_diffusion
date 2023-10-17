@@ -232,17 +232,18 @@ class GaussianDiffusion:
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def psnr(self, xstart, At, corrupted_image):
-        def process_img(img):
-            img = ((img + 1) * 127.5).clamp(0, 255).to(th.uint8)
-            img = img.permute(0, 2, 3, 1)
-            return img
-        # PSNR
-        img1_tensor = process_img(self.convolve(At, xstart))
-        img2_tensor = process_img(corrupted_image)
-        mse = th.mean((img1_tensor - img2_tensor) ** 2 + 1e-9, dtype=th.float32)
-        psnr = 20 * th.log10(255.0 / th.sqrt(mse))
+        with th.no_grad():
+            def process_img(img):
+                img = ((img + 1) * 127.5).clamp(0, 255).to(th.uint8)
+                img = img.permute(0, 2, 3, 1)
+                return img
+            # PSNR
+            img1_tensor = process_img(self.convolve(At, xstart))
+            img2_tensor = process_img(corrupted_image)
+            mse = th.mean((img1_tensor - img2_tensor) ** 2 + 1e-9, dtype=th.float32)
+            psnr = 20 * th.log10(255.0 / th.sqrt(mse))
 
-        return psnr
+            return psnr
 
     def p_mean_variance(
         self, model, x, t, clip_denoised=True, denoised_fn=None,
@@ -420,12 +421,13 @@ class GaussianDiffusion:
             log_probability = - th.norm(A_x_convolve - y_t) ** 2
             return log_probability
 
-    def _predict_At_from_y(self, y, t, x_t, A, eps, eta=4e-3, n_steps=200,
+    def _predict_At_from_y(self, y, t, x_t, A, eps, eta=4e-3, n_steps=100,
                            lambda_=1e-2, clip_value=1.5, verbose=False, wandb_log=True):
         with th.enable_grad():
             assert y.shape == x_t.shape
 
-            channels, kernel_size = x_t.size() [1], A.size() [2]
+            batch_size, channels, kernel_size = x_t.size()[0], x_t.size()[1], A.size()[2]
+
             blur_kernel_A = th.nn.Conv2d(in_channels=channels, out_channels=channels,
                                          kernel_size=kernel_size, groups=channels, bias=False,
                                          padding=kernel_size // 2, device=A.device,
@@ -456,8 +458,9 @@ class GaussianDiffusion:
                 optimizer_A.step()
                 optimizer_A.zero_grad()
             if wandb_log:
-                wandb.log({"Timestep": t.item(), "Average Likelihood": np.mean(loss_values)})
-            print(f"Timestep #{t}, average likelihood: {np.mean(loss_values)}")
+                wandb.log({"Timestep": t[0].item(), "Log Likelihood": np.mean(loss_values),
+                           "Log Likelihood average across batch": np.mean(loss_values) / batch_size})
+            print(f"Timestep #{t[0].item()}, average likelihood: {np.mean(loss_values)}")
 
             # Compute gradient wrt A_t (required for guidance)
             gradient_At = th.autograd.grad(self.blur_log_likelihood(y, t, x_t, blur_kernel_A, eps), blur_kernel_A.weight) [0]
@@ -579,6 +582,18 @@ class GaussianDiffusion:
         gaussian_kernel = gaussian_kernel.cuda()
 
         return gaussian_kernel
+
+    def get_uniform_filter(self, kernel_size):
+        """
+        Ground truth uniform kernel
+        """
+        uniform_kernel = th.ones(1, kernel_size, kernel_size)
+        uniform_kernel = uniform_kernel / (kernel_size * kernel_size)
+        uniform_kernel = uniform_kernel.repeat(3, 1, 1, 1)
+        uniform_kernel = uniform_kernel.cuda()
+
+        return uniform_kernel
+
     def p_sample(
         self,
         model,
@@ -640,12 +655,8 @@ class GaussianDiffusion:
 
         if wandb_log:
             # TODO Modify for Gaussian case
-            kernel_size = out["pred_At"].size() [-1]
+            kernel_size, batch_size = out["pred_At"].size()[-1], x.size()[0]
             ground_truth_kernel = self.get_gaussian_filter(kernel_size)
-            # ground_truth_kernel = th.ones(1, kernel_size, kernel_size)
-            # ground_truth_kernel = ground_truth_kernel / (kernel_size * kernel_size)
-            # ground_truth_kernel = ground_truth_kernel.repeat(3, 1, 1, 1)
-            # ground_truth_kernel = ground_truth_kernel.cuda()
 
             psnr_val = self.psnr(out["pred_xstart"], out["pred_At"], corrupted_image)
             cosine_similarity = th.nn.CosineSimilarity(dim=0, eps=1e-6)
@@ -654,37 +665,30 @@ class GaussianDiffusion:
             wandb.log({"PSNR X start vs Observation": psnr_val,
                     "Mean cosine similarity": th.mean(cosine_kernels)})
 
-        if t % 100 == 0:
+        if t[0].item() % 100 == 0:
             from PIL import Image
-            mu = ((out["mean"] + 1) * 127.5).clamp(0, 255).to(th.uint8)
+            mu = ((out["mean"] + 1) * 127.5).clamp(0,255).to(th.uint8)
             mu = mu.permute(0,2,3,1)
-            x_prev = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
-            x_prev = x_prev.permute(0, 2, 3, 1)
+            x_prev = ((sample + 1) * 127.5).clamp(0,255).to(th.uint8)
+            x_prev = x_prev.permute(0,2,3,1)
 
-            im = Image.fromarray(mu[0].cpu().numpy())
-            im.save(f"imgs/means/mean_long_{t.item()}.jpg")
-
-            im2 = Image.fromarray(x_prev[0].cpu().numpy())
-            im2.save(f"imgs/samples/sample_long_{t.item()}.jpg")
-
-            # kernel_r = out["pred_At"][0, 0, :, :].cpu().numpy()
-            # kernel_g = out["pred_At"][1, 0, :, :].cpu().numpy()
-            # kernel_b = out["pred_At"][2, 0, :, :].cpu().numpy()
             if wandb_log:
                 plt.imshow(cosine_kernels.cpu().numpy()[0], cmap='viridis', interpolation='nearest')
                 plt.colorbar()
-                plt.savefig(f'imgs/cosine_similarity_kernels/cosine_similarity_kernels_{t.item()}.jpg')
+                plt.savefig(f'imgs/cosine_similarity_kernels/cosine_similarity_kernels_{t[0].item()}.jpg')
                 plt.close()
                 print(out["pred_At"])
 
-                wandb.log({f"mean_log_{t.item()}": wandb.Image(im, caption="Diffusion Model mean for Timestep"),
-                        f"sample_log_{t.item()}": wandb.Image(im2, caption="Sample for Timestep")})
+                for i in range(batch_size):
+                    im = Image.fromarray(mu[i].cpu().numpy())
+                    im.save(f"imgs/means/mean_log_{t[0].item()}_{i}.jpg")
 
-            # wandb.log({f"mean_log_{t.item()}": wandb.Image(im, caption="Diffusion Model mean for Timestep"),
-            #            f"sample_log_{t.item()}": wandb.Image(im2, caption="Sample for Timestep"),
-            #            f"blur_kernel_log_{t.item()}": wandb.Histogram(kernel_r),
-            #            f"blur_kernel_log_{t.item()}": wandb.Histogram(kernel_g),
-            #            f"blur_kernel_log_{t.item()}": wandb.Histogram(kernel_b)})
+                    im2 = Image.fromarray(x_prev[i].cpu().numpy())
+                    im2.save(f"imgs/samples/sample_log_{t[0].item()}_{i}.jpg")
+
+                    wandb.log({f"mean_log_{t[0].item()}_{i}": wandb.Image(im, caption="Diffusion Model mean for Timestep"),
+                            f"sample_log_{t[0].item()}_{i}": wandb.Image(im2, caption="Sample for Timestep")})
+
 
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
@@ -733,7 +737,7 @@ class GaussianDiffusion:
         if wandb_log:
             WANDB_USER_NAME="sai-advaith"
             WANDB_PROJECT_NAME="deblur_diffusion"
-            WANDB_RUN_NAME = "gaussian_blur_kernel_estimation_epochs_200_kernel_0_perturb_init"
+            WANDB_RUN_NAME = "gaussian_blur_kernel_estimation_epochs_100_kernel_0_perturb_init_batch_size_8"
 
             print(WANDB_RUN_NAME)
 
@@ -742,10 +746,11 @@ class GaussianDiffusion:
                        config={
                            "lambda": 1e-2,
                            "eta": 4e-3,
-                           "A_optimize_steps": 200,
+                           "A_optimize_steps": 100,
                            "clip_value": 1.5,
                            "perturb": 0,
-                           "diffusion_steps": self.num_timesteps
+                           "diffusion_steps": self.num_timesteps,
+                           "batch_size": shape[0]
                        })
 
         for sample in self.p_sample_loop_progressive(

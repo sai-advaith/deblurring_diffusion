@@ -103,7 +103,28 @@ def get_corrupted_image(image_path):
     img = Image.open(image_path)
     img_tensor = transform(img).to(dist_util.dev())
     img_tensor = (img_tensor * 2) - 1
+
     return img_tensor.unsqueeze(dim=0)
+
+def get_corrupted_batch(data_dir, idx_low, idx_high, image_path=None):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    # Load images as batch
+    images = []
+    for i in range(idx_low, idx_high):
+        image_path_i = f"{data_dir}/blur_{i}.jpg"
+        img_i = Image.open(image_path_i)
+        img_tensor_i = transform(img_i).to(dist_util.dev())
+        img_tensor_i = (img_tensor_i * 2) - 1
+        images.append(img_tensor_i)
+
+    # TODO: Remove this, only for experimentation purposes
+    if image_path is not None:
+        images.append(get_corrupted_image(image_path).squeeze(dim=0))
+
+    return th.stack(images, dim=0)
 
 def main():
     args = create_argparser().parse_args()
@@ -136,8 +157,16 @@ def main():
     classifier.eval()
     logger.log("classifer loaded")
 
+    assert args.batch_load == args.batch_size == args.num_samples
+
     # Creating uniform blur kernel of size kernel size x kernel size
-    corrupted_image = get_corrupted_image(args.image_path)
+    if args.batch_load == 1:
+        corrupted_image = get_corrupted_image(args.image_path)
+    else:
+        corrupted_image = get_corrupted_batch(args.data_dir, args.idx_low,
+                                              args.idx_high, args.image_path)
+
+    # TODO: Make 0.05 an argument
     blur_kernel = init_blur_kernel(args.kernel_size, args.diffusion_steps, 0.05)
 
     def cond_fn(x, t, y=None):
@@ -176,7 +205,7 @@ def main():
             corrupted_image=corrupted_image,
             device=dist_util.dev(),
             gradient_scaling=args.classifier_scale,
-            wandb_log=False
+            wandb_log=True
         )
         # Back to [0, 255] range
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
@@ -215,7 +244,11 @@ def create_argparser():
         classifier_path="",
         classifier_scale=1.0,
         kernel_size=5,
-        image_path=None
+        image_path=None,
+        batch_load=-1,
+        idx_low=-1,
+        idx_high=-1,
+        data_dir=None,
     )
     defaults.update(model_and_diffusion_defaults())
     defaults.update(classifier_defaults())
