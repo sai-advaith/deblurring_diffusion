@@ -58,10 +58,6 @@ def uniform_blur_filter(input_image, kernel_size):
     return output_image
 
 def gaussian_blur_filter(input_image, kernel_size, sigma):
-    # Set these to whatever you want for your gaussian filter
-    kernel_size = 5
-    sigma = 25
-
     # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
     x_cord = torch.arange(kernel_size)
     x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)

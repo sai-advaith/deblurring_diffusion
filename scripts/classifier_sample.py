@@ -113,16 +113,16 @@ def get_corrupted_batch(data_dir, idx_low, idx_high, image_path=None):
 
     # Load images as batch
     images = []
-    for i in range(idx_low, idx_high):
+    for i in range(idx_low, idx_high+1):
         image_path_i = f"{data_dir}/blur_{i}.jpg"
         img_i = Image.open(image_path_i)
         img_tensor_i = transform(img_i).to(dist_util.dev())
         img_tensor_i = (img_tensor_i * 2) - 1
         images.append(img_tensor_i)
 
-    # TODO: Remove this, only for experimentation purposes
-    if image_path is not None:
-        images.append(get_corrupted_image(image_path).squeeze(dim=0))
+    # # TODO: Remove this, only for experimentation purposes
+    # if image_path is not None:
+    #     images.append(get_corrupted_image(image_path).squeeze(dim=0))
 
     return th.stack(images, dim=0)
 
