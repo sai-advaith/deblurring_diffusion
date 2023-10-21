@@ -167,7 +167,8 @@ def main():
                                               args.idx_high, args.image_path)
 
     # TODO: Make 0.05 an argument
-    blur_kernel = init_blur_kernel(args.kernel_size, args.diffusion_steps, 0.05)
+    std = 0.05
+    blur_kernel = init_blur_kernel(args.kernel_size, args.diffusion_steps, std)
 
     def cond_fn(x, t, y=None):
         assert y is not None
