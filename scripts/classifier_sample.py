@@ -206,7 +206,7 @@ def main():
             corrupted_image=corrupted_image,
             device=dist_util.dev(),
             gradient_scaling=args.classifier_scale,
-            wandb_log=True
+            wandb_log=args.wandb_log
         )
         # Back to [0, 255] range
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
@@ -250,6 +250,7 @@ def create_argparser():
         idx_low=-1,
         idx_high=-1,
         data_dir=None,
+        wandb_log=False
     )
     defaults.update(model_and_diffusion_defaults())
     defaults.update(classifier_defaults())
