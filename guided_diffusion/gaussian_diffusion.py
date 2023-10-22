@@ -343,7 +343,7 @@ class GaussianDiffusion:
                         y=corrupted_image, t=t, x_t=x, A=blur_kernel,
                         eps=model_output, wandb_log=wandb_log
                     )
-                    pred_At = process_kernel(pred_At)
+                    # pred_At = process_kernel(pred_At)
 
                     pred_yt = process_xstart(
                         # TODO: Check if predicted A_t or blur_kernel
@@ -380,8 +380,7 @@ class GaussianDiffusion:
             # Define the blur convolution function
             blur = th.nn.Conv2d(in_channels=channels, out_channels=channels,
                             kernel_size=kernel_size, groups=channels, bias=False,
-                            padding=kernel_size // 2, padding_mode='reflect',
-                            device=blur_kernel.device)
+                            padding=kernel_size // 2, device=blur_kernel.device)
 
             blur.weight.data = blur_kernel
             blur.weight.requires_grad = set_gradient
@@ -430,8 +429,7 @@ class GaussianDiffusion:
 
             blur_kernel_A = th.nn.Conv2d(in_channels=channels, out_channels=channels,
                                          kernel_size=kernel_size, groups=channels, bias=False,
-                                         padding=kernel_size // 2, device=A.device,
-                                         padding_mode='reflect')
+                                         padding=kernel_size // 2, device=A.device)
 
             # A_copy = A.data.detach().clone()
             blur_kernel_A.weight.data = A.data
