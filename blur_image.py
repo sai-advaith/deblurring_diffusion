@@ -16,6 +16,7 @@ def create_parser():
     parser.add_argument("--uniform", action="store_true")
     parser.add_argument("--kernel_size", type=int, help="size of kernel to convolve")
     parser.add_argument("--motion", action="store_true")
+    parser.add_argument("--multi", action="store_true")
 
     # Image paths
     parser.add_argument("--load_img_path", help="image path to load image")
@@ -28,6 +29,69 @@ def create_parser():
     parser.add_argument("--batch", action="store_true")
     parser.add_argument("--batch_path", help="batch of images generated path")
     return parser
+
+def multiple_blur_kernel(input_image, kernel_size, sigma):
+    uniform_kernel = torch.ones(1, 1, kernel_size, kernel_size)
+    uniform_kernel = uniform_kernel / (kernel_size * kernel_size)
+
+    channels = input_image.size() [0]
+
+    # Reshape to 2d depthwise convolutional weight
+    uniform_kernel = uniform_kernel.view(1, kernel_size, kernel_size)
+    uniform_kernel = uniform_kernel.repeat(channels, 1, 1, 1)
+    uniform_kernel = uniform_kernel.cuda()
+
+    # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
+    x_cord = torch.arange(kernel_size)
+    x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
+    y_grid = x_grid.t()
+    xy_grid = torch.stack([x_grid, y_grid], dim=-1)
+
+    mean = (kernel_size - 1)/2.
+    variance = sigma**2.
+
+    # Calculate the 2-dimensional gaussian kernel which is
+    # the product of two gaussian distributions for two different
+    # variables (in this case called x and y)
+    channels = input_image.size() [0]
+
+    gaussian_kernel = (1./(2.*math.pi*variance)) *\
+                    torch.exp(
+                        -torch.sum((xy_grid - mean)**2., dim=-1) /\
+                        (2*variance)
+                    )
+    # Make sure sum of values in gaussian kernel equals 1.
+    gaussian_kernel = gaussian_kernel / torch.sum(gaussian_kernel)
+
+    # Reshape to 2d depthwise convolutional weight
+    gaussian_kernel = gaussian_kernel.view(1, kernel_size, kernel_size)
+    gaussian_kernel = gaussian_kernel.repeat(channels, 1, 1, 1)
+    gaussian_kernel = gaussian_kernel.cuda()
+
+    padding = gaussian_kernel.shape[-1] - 1
+    k3 = torch.conv2d(uniform_kernel, gaussian_kernel,
+                        padding=padding)[:1]
+    k3 = k3.permute(1, 0, 2, 3)
+    print(k3)
+
+    channels, size = k3.size() [0], k3.size()[-1]
+    multiple_kernel = torch.nn.Conv2d(in_channels=channels, out_channels=channels,
+                                      kernel_size=size, groups=channels, bias=False,
+                                      padding=size // 2, padding_mode='reflect',
+                                      device=input_image.device)
+    multiple_kernel.weight.data = k3
+    multiple_kernel.weight.requires_grad = False
+
+    output_image = multiple_kernel(input_image) * 255
+
+    measurement_noise = torch.normal(0, 10, size=output_image.size())
+    measurement_noise = measurement_noise.cuda()
+
+    output_image = output_image + measurement_noise
+    output_image = output_image.clamp(0, 255).to(torch.uint8)
+
+    output_image = output_image / 255
+    return output_image
 
 def uniform_blur_filter(input_image, kernel_size):
     kernel = torch.ones(1, 1, kernel_size, kernel_size)
@@ -43,7 +107,7 @@ def uniform_blur_filter(input_image, kernel_size):
 
     uniform_filter = torch.nn.Conv2d(in_channels=channels, out_channels=channels,
                                       kernel_size=kernel_size, groups=channels, bias=False,
-                                      padding=kernel_size // 2, padding_mode='replicate',
+                                      padding=kernel_size // 2, padding_mode='reflect',
                                       device=input_image.device)
 
     uniform_filter.weight.data = kernel
@@ -113,11 +177,11 @@ def motion_blur_filter(input_image):
     channels, kernel_size = input_image.size() [0], 5
 
     # 45 degrees, 135 degrees
-    motion_blur_data = torch.tensor([[1.0, 0.0, 0.0, 0.0, 1.0],
-                                     [0.0, 1.0, 0.0, 1.0, 0.0],
-                                     [0.0, 0.0, 1.0, 0.0, 0.0],
-                                     [0.0, 1.0, 0.0, 1.0, 0.0],
-                                     [1.0, 0.0, 0.0, 0.0, 1.0]])
+    motion_blur_data = torch.tensor([[0.,0.,0.,0.00414365, 0.],
+                                    [0.01104972, 0.16298343, 0.02348066, 0., 0.00414365],
+                                    [0.00690608, 0.13259669, 0.19475138, 0.0980663,  0.],
+                                    [0., 0., 0.03453039, 0.18370166, 0.09530387],
+                                    [0., 0.00552486, 0.,0.01104972, 0.03176796]])
     motion_blur_data = motion_blur_data.cuda()
     motion_blur_data = motion_blur_data / torch.sum(motion_blur_data)
 
@@ -135,11 +199,11 @@ def motion_blur_filter(input_image):
     motion_blur_filter.weight.requires_grad = False
     output_image = motion_blur_filter(input_image) * 255
 
-    # measurement_noise = torch.normal(0, 10, size=output_image.size())
-    # measurement_noise = measurement_noise.cuda()
+    measurement_noise = torch.normal(0, 10, size=output_image.size())
+    measurement_noise = measurement_noise.cuda()
 
-    # output_image = output_image + measurement_noise
-    # output_image = output_image.clamp(0, 255).to(torch.uint8)
+    output_image = output_image + measurement_noise
+    output_image = output_image.clamp(0, 255).to(torch.uint8)
 
     output_image = output_image / 255
 
@@ -199,6 +263,10 @@ if args.uniform:
         noisy_tensor = noisy_tensor.unsqueeze(dim=0)
 if args.motion:
     noisy_tensor = motion_blur_filter(img_tensor)
+    noisy_tensor = noisy_tensor.unsqueeze(dim=0)
+
+if args.multi:
+    noisy_tensor = multiple_blur_kernel(img_tensor, args.kernel_size, args.sigma)
     noisy_tensor = noisy_tensor.unsqueeze(dim=0)
 
 print(noisy_tensor.size())

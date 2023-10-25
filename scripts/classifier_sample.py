@@ -26,6 +26,15 @@ from guided_diffusion.script_util import (
     add_dict_to_argparser,
     args_to_dict,
 )
+def get_multi_filter(kernel_size, sigma):
+    uniform_kernel = get_uniform_filter(kernel_size - 2)
+    gaussian_kernel = get_gaussian_filter(kernel_size - 2, sigma)
+
+    padding = gaussian_kernel.shape[-1] - 1
+    multi_kernel = th.conv2d(uniform_kernel, gaussian_kernel,
+                                padding=padding) [:1]
+    multi_kernel = multi_kernel.permute(1, 0, 2, 3)
+    return multi_kernel
 
 def init_blur_kernel(kernel_size, timesteps, std):
     """
@@ -55,13 +64,27 @@ def get_uniform_filter(kernel_size):
 
     return kernel
 
-def get_gaussian_filter(kernel_size):
+def get_motion_filter(kernel_size):
+    # 45 degrees, 135 degrees
+    motion_blur_data = th.tensor([[0.,0.,0.,0.00414365, 0.],
+                                    [0.01104972, 0.16298343, 0.02348066, 0., 0.00414365],
+                                    [0.00690608, 0.13259669, 0.19475138, 0.0980663,  0.],
+                                    [0., 0., 0.03453039, 0.18370166, 0.09530387],
+                                    [0., 0.00552486, 0.,0.01104972, 0.03176796]])
+
+    motion_blur_data = motion_blur_data.cuda()
+    motion_blur_data = motion_blur_data / th.sum(motion_blur_data)
+
+    motion_blur_data = motion_blur_data.view(1, kernel_size, kernel_size)
+    motion_blur_data = motion_blur_data.repeat(3, 1, 1, 1)
+    motion_blur_data = motion_blur_data.cuda()
+
+    return motion_blur_data
+
+def get_gaussian_filter(kernel_size, sigma):
     """
     Given kernel size, output the blur filter
     """
-    # Set these to whatever you want for your gaussian filter
-    sigma = 20
-
     # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
     x_cord = th.arange(kernel_size)
     x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
@@ -129,6 +152,7 @@ def get_corrupted_batch(data_dir, idx_low, idx_high, image_path=None):
 def main():
     args = create_argparser().parse_args()
 
+    th.cuda.set_device(args.gpu_device_num)
     dist_util.setup_dist()
     logger.configure()
 
@@ -195,19 +219,30 @@ def main():
         sample_fn = (
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
-        sample = sample_fn(
-            model_fn,
-            (args.batch_size, 3, args.image_size, args.image_size),
-            clip_denoised=args.clip_denoised,
-            model_kwargs=model_kwargs,
-            cond_fn=cond_fn,
-            adaptive_diffusion=True,
-            kernel=blur_kernel,
-            corrupted_image=corrupted_image,
-            device=dist_util.dev(),
-            gradient_scaling=args.classifier_scale,
-            wandb_log=args.wandb_log
-        )
+        if args.use_ddim:
+            sample = sample_fn(
+                model_fn,
+                (args.batch_size, 3, args.image_size, args.image_size),
+                clip_denoised=args.clip_denoised,
+                model_kwargs=model_kwargs,
+                cond_fn=cond_fn,
+                device=dist_util.dev(),
+            )
+        else:
+            sample = sample_fn(
+                model_fn,
+                (args.batch_size, 3, args.image_size, args.image_size),
+                clip_denoised=args.clip_denoised,
+                model_kwargs=model_kwargs,
+                cond_fn=cond_fn,
+                adaptive_diffusion=True,
+                kernel=blur_kernel,
+                noise=corrupted_image,
+                corrupted_image=corrupted_image,
+                device=dist_util.dev(),
+                gradient_scaling=args.classifier_scale,
+                wandb_log=args.wandb_log
+            )
         # Back to [0, 255] range
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
         sample = sample.permute(0, 2, 3, 1)
@@ -250,7 +285,8 @@ def create_argparser():
         idx_low=-1,
         idx_high=-1,
         data_dir=None,
-        wandb_log=False
+        wandb_log=False,
+        gpu_device_num=0
     )
     defaults.update(model_and_diffusion_defaults())
     defaults.update(classifier_defaults())

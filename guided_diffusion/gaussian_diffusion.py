@@ -343,12 +343,14 @@ class GaussianDiffusion:
                         y=corrupted_image, t=t, x_t=x, A=blur_kernel,
                         eps=model_output, wandb_log=wandb_log
                     )
-                    # pred_At = process_kernel(pred_At)
+                    pred_At = process_kernel(pred_At)
+
+                    # pred_At, gradient_At = blur_kernel, None
 
                     pred_yt = process_xstart(
                         # TODO: Check if predicted A_t or blur_kernel
                         self._predict_yt_from_eps(y=corrupted_image, t=t,
-                                                A=pred_At, eps=model_output)
+                                                  A=pred_At, eps=model_output)
                     )
 
             model_mean, _, _ = self.q_posterior_mean_variance(
@@ -380,7 +382,8 @@ class GaussianDiffusion:
             # Define the blur convolution function
             blur = th.nn.Conv2d(in_channels=channels, out_channels=channels,
                             kernel_size=kernel_size, groups=channels, bias=False,
-                            padding=kernel_size // 2, device=blur_kernel.device)
+                            padding=kernel_size // 2, device=blur_kernel.device,
+                            padding_mode='reflect')
 
             blur.weight.data = blur_kernel
             blur.weight.requires_grad = set_gradient
@@ -429,7 +432,8 @@ class GaussianDiffusion:
 
             blur_kernel_A = th.nn.Conv2d(in_channels=channels, out_channels=channels,
                                          kernel_size=kernel_size, groups=channels, bias=False,
-                                         padding=kernel_size // 2, device=A.device)
+                                         padding=kernel_size // 2, device=A.device,
+                                         padding_mode='reflect')
 
             # A_copy = A.data.detach().clone()
             blur_kernel_A.weight.data = A.data
@@ -545,12 +549,10 @@ class GaussianDiffusion:
         )
         return out
 
-    def get_gaussian_filter(self, kernel_size):
+    def get_gaussian_filter(self, kernel_size, sigma):
         """
         Given kernel size, output the blur filter
         """
-        # Set these to whatever you want for your gaussian filter
-        sigma = 25
 
         # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
         x_cord = th.arange(kernel_size)
@@ -592,6 +594,31 @@ class GaussianDiffusion:
 
         return uniform_kernel
 
+    def get_multi_filter(self, kernel_size, sigma):
+        uniform_kernel = self.get_uniform_filter(kernel_size - 2)
+        gaussian_kernel = self.get_gaussian_filter(kernel_size - 2, sigma)
+
+        padding = gaussian_kernel.shape[-1] - 1
+        multi_kernel = th.conv2d(uniform_kernel, gaussian_kernel,
+                                 padding=padding) [:1]
+        multi_kernel = multi_kernel.permute(1, 0, 2, 3)
+        return multi_kernel
+
+    def get_motion_filter(self, kernel_size):
+        # 45 degrees, 135 degrees
+        motion_blur_data = th.tensor([[0.,0.,0.,0.00414365, 0.],
+                                        [0.01104972, 0.16298343, 0.02348066, 0., 0.00414365],
+                                        [0.00690608, 0.13259669, 0.19475138, 0.0980663,  0.],
+                                        [0., 0., 0.03453039, 0.18370166, 0.09530387],
+                                        [0., 0.00552486, 0.,0.01104972, 0.03176796]])
+        motion_blur_data = motion_blur_data.cuda()
+        motion_blur_data = motion_blur_data / th.sum(motion_blur_data)
+
+        motion_blur_data = motion_blur_data.view(1, kernel_size, kernel_size)
+        motion_blur_data = motion_blur_data.repeat(3, 1, 1, 1)
+        motion_blur_data = motion_blur_data.cuda()
+
+        return motion_blur_data
     def p_sample(
         self,
         model,
@@ -654,7 +681,7 @@ class GaussianDiffusion:
         if wandb_log:
             # TODO Modify for Gaussian case
             kernel_size, batch_size = out["pred_At"].size()[-1], x.size()[0]
-            ground_truth_kernel = self.get_gaussian_filter(kernel_size)
+            ground_truth_kernel = self.get_motion_filter(kernel_size)
 
             psnr_val = self.psnr(out["pred_xstart"], out["pred_At"], corrupted_image)
             cosine_similarity = th.nn.CosineSimilarity(dim=0, eps=1e-6)

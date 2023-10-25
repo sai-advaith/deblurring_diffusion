@@ -166,5 +166,8 @@ mid_logs/
 gradient_logs/
 *.npz
 imgs/
-output.txt
+*.txt
 wandb/
+
+# Results directory
+results/*
