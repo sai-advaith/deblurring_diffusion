@@ -190,9 +190,11 @@ def main():
         corrupted_image = get_corrupted_batch(args.data_dir, args.idx_low,
                                               args.idx_high, args.image_path)
 
+
     # TODO: Make 0.05 an argument
     std = 0.05
     blur_kernel = init_blur_kernel(args.kernel_size, args.diffusion_steps, std)
+    # blur_kernel = None
 
     def cond_fn(x, t, y=None):
         assert y is not None
@@ -224,6 +226,7 @@ def main():
                 model_fn,
                 (args.batch_size, 3, args.image_size, args.image_size),
                 clip_denoised=args.clip_denoised,
+                noise=corrupted_image,
                 model_kwargs=model_kwargs,
                 cond_fn=cond_fn,
                 device=dist_util.dev(),
@@ -237,7 +240,7 @@ def main():
                 cond_fn=cond_fn,
                 adaptive_diffusion=True,
                 kernel=blur_kernel,
-                noise=corrupted_image,
+                noise=None,
                 corrupted_image=corrupted_image,
                 device=dist_util.dev(),
                 gradient_scaling=args.classifier_scale,

@@ -1,15 +1,16 @@
 import numpy as np
 from PIL import Image
+import matplotlib.pyplot as plt
+import argparse
+import piqa
+import lpips
+import warnings
 
 import torch
 import torchvision
 import torchvision.transforms as T
 import torch.nn.functional as F
 
-from PIL import Image
-import matplotlib.pyplot as plt
-
-import argparse
 
 def load_parser():
     parser = argparse.ArgumentParser()
@@ -63,27 +64,48 @@ def plot(file_path):
     plt.title('Probability vs Diffusion Timestep')
     plt.savefig('learning_curve_prob.png')
 
-def transform_img(img_path):
+def transform_img(img_path, permute=True, expand_range=False):
     # Define transformation
     transform = T.Compose([
         T.ToTensor(),
     ])
 
     img = Image.open(img_path)
-    img_tensor = transform(img).cuda() * 255.0
-    img_tensor = img_tensor.to(torch.uint8)
-    img_tensor = img_tensor.permute(1, 2, 0)
+    img_tensor = transform(img)
+    if expand_range:
+        img_tensor = img_tensor.cuda() * 255.0
+        img_tensor = img_tensor.to(torch.uint8)
+    if permute:
+        img_tensor = img_tensor.permute(1, 2, 0)
 
     return img_tensor
 
 def measure_eval(image_path1, image_path2):
-    img1_tensor, img2_tensor = transform_img(image_path1), transform_img(image_path2)
- 
-    # PSNR
-    mse = torch.mean((img1_tensor - img2_tensor) ** 2 + 1e-9, dtype=torch.float32)
-    psnr = 20 * torch.log10(255.0 / torch.sqrt(mse))
+    warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
 
-    print(f"PSNR between the {image_path1}, {image_path2} is: {psnr}")
+    # [0,1] float tensor
+    img1_tensor = transform_img(image_path1, permute=False).unsqueeze(dim=0).cpu()
+    img2_tensor = transform_img(image_path2, permute=False).unsqueeze(dim=0).cpu()
+
+    img1, img2 = (2 * img1_tensor) - 1, (2 * img2_tensor) - 1
+
+    # PSNR
+    lpips_alex_fn = lpips.LPIPS(net='alex')
+    lpips_val = lpips_alex_fn(img1, img2).item()
+
+    # PSNR, SSIM
+    psnr_fn, ssim_fn = piqa.PSNR(), piqa.SSIM()
+    psnr_val = psnr_fn(img1_tensor, img2_tensor)
+    ssim_val = ssim_fn(img1_tensor, img2_tensor)
+
+    # print(lpips_val.size())
+    print(f"PSNR between {image_path1} and {image_path2} is: {psnr_val}")
+    print(f"SSIM between {image_path1} and {image_path2} is: {ssim_val}")
+    print(f"LPIPS between {image_path1} and {image_path2} is: {lpips_val}\n")
+
+    # return psnr_val, ssim_val, lpips_val
+
 # Create parser for different utility tasks
 util_parser = load_parser()
 

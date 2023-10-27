@@ -12,6 +12,9 @@ import numpy as np
 import torch as th
 import matplotlib.pyplot as plt
 import wandb
+import piqa
+import lpips
+import warnings
 
 from .nn import mean_flat
 from .losses import normal_kl, discretized_gaussian_log_likelihood
@@ -231,19 +234,26 @@ class GaussianDiffusion:
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def psnr(self, xstart, At, corrupted_image):
+    def metrics(self, img1_tensor, img2_tensor):
         with th.no_grad():
-            def process_img(img):
-                img = ((img + 1) * 127.5).clamp(0, 255).to(th.uint8)
-                img = img.permute(0, 2, 3, 1)
-                return img
-            # PSNR
-            img1_tensor = process_img(self.convolve(At, xstart))
-            img2_tensor = process_img(corrupted_image)
-            mse = th.mean((img1_tensor - img2_tensor) ** 2 + 1e-9, dtype=th.float32)
-            psnr = 20 * th.log10(255.0 / th.sqrt(mse))
+            # LPIPS
+            # Suppress LPIPS warnings
+            warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+            warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
 
-            return psnr
+            loss_fn_alex = lpips.LPIPS(net='alex')
+            lpips_val = loss_fn_alex(img1_tensor.cpu(), img2_tensor.cpu()).item()
+
+            # PSNR
+            img1, img2 = 0.5 * (img1_tensor + 1), 0.5 * (img2_tensor + 1)
+            psnr_fn, ssim_fn = piqa.PSNR(), piqa.SSIM()
+            psnr_val = psnr_fn(img1.cpu(), img2.cpu()).item()
+            ssim_val = ssim_fn(img1.cpu(), img2.cpu()).item()
+
+        # Restore warnings (if needed)
+        warnings.resetwarnings()
+
+        return psnr_val, ssim_val, lpips_val
 
     def p_mean_variance(
         self, model, x, t, clip_denoised=True, denoised_fn=None,
@@ -683,12 +693,15 @@ class GaussianDiffusion:
             kernel_size, batch_size = out["pred_At"].size()[-1], x.size()[0]
             ground_truth_kernel = self.get_motion_filter(kernel_size)
 
-            psnr_val = self.psnr(out["pred_xstart"], out["pred_At"], corrupted_image)
+            psnr_val, ssim_val, lpips_val = self.metrics(self.convolve(out["pred_At"], out["pred_xstart"]), corrupted_image)
+
             cosine_similarity = th.nn.CosineSimilarity(dim=0, eps=1e-6)
             cosine_kernels = cosine_similarity(out["pred_At"], ground_truth_kernel)
 
-            wandb.log({"PSNR X start vs Observation": psnr_val,
-                    "Mean cosine similarity": th.mean(cosine_kernels)})
+            wandb.log({"PSNR Predicted Kernel over X start vs Observation": psnr_val,
+                       "SSIM Predicted Kernel over X start vs Observation": ssim_val,
+                       "LPIPS Predicted Kernel over X start vs Observation": lpips_val,
+                       "Mean cosine similarity": th.mean(cosine_kernels)})
 
         if t[0].item() % 100 == 0:
             from PIL import Image
@@ -828,7 +841,8 @@ class GaussianDiffusion:
             img = noise
         else:
             img = th.randn(*shape, device=device)
-        indices = list(range(self.num_timesteps))[::-1]
+        # indices = list(range(self.num_timesteps))[::-1]
+        indices = list(range(26))[::-1]
 
         if progress:
             # Lazy import so that we don't depend on tqdm.
@@ -1003,7 +1017,8 @@ class GaussianDiffusion:
             img = noise
         else:
             img = th.randn(*shape, device=device)
-        indices = list(range(self.num_timesteps))[::-1]
+        # indices = list(range(self.num_timesteps))[::-1]
+        indices = list(range(76))[::-1]
 
         if progress:
             # Lazy import so that we don't depend on tqdm.
