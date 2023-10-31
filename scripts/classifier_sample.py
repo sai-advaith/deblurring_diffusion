@@ -26,15 +26,28 @@ from guided_diffusion.script_util import (
     add_dict_to_argparser,
     args_to_dict,
 )
-def get_multi_filter(kernel_size, sigma):
-    uniform_kernel = get_uniform_filter(kernel_size - 2)
-    gaussian_kernel = get_gaussian_filter(kernel_size - 2, sigma)
+def get_no_blur_filter(kernel_size):
+    with th.no_grad():
+        kernel = th.zeros((kernel_size, kernel_size), dtype=th.float32)
+        kernel[kernel_size // 2, kernel_size // 2] = 1.0
 
-    padding = gaussian_kernel.shape[-1] - 1
-    multi_kernel = th.conv2d(uniform_kernel, gaussian_kernel,
-                                padding=padding) [:1]
-    multi_kernel = multi_kernel.permute(1, 0, 2, 3)
-    return multi_kernel
+        # Reshape to 2d depthwise convolutional weight
+        kernel = kernel.view(1, kernel_size, kernel_size)
+        kernel = kernel.repeat(3, 1, 1, 1)
+        kernel = kernel.cuda()
+
+        return kernel
+
+def get_multi_filter(kernel_size, sigma1, sigma2):
+    with th.no_grad():
+        mean1, mean2 = 0.0, 1.0
+        gaussian_kernel1 = get_gaussian_filter(kernel_size - 2, sigma1, mean1)
+        gaussian_kernel2 = get_gaussian_filter(kernel_size - 2, sigma2, mean2)
+
+        padding = gaussian_kernel2.shape[-1] - 1
+        multi_kernel = th.conv2d(gaussian_kernel2, gaussian_kernel1, padding=padding) [:1]
+        multi_kernel = multi_kernel.permute(1, 0, 2, 3)
+        return multi_kernel
 
 def init_blur_kernel(kernel_size, timesteps, std):
     """
@@ -55,64 +68,72 @@ def init_blur_kernel(kernel_size, timesteps, std):
     return kernel
 
 def get_uniform_filter(kernel_size):
-    kernel = th.ones(1, kernel_size, kernel_size)
-    kernel = kernel / (kernel_size * kernel_size)
+    with th.no_grad():
+        kernel = th.ones(1, kernel_size, kernel_size)
+        kernel = kernel / (kernel_size * kernel_size)
 
-    # Reshape to 2d depthwise convolutional weight
-    kernel = kernel.repeat(3, 1, 1, 1)
-    kernel = kernel.cuda()
+        # Reshape to 2d depthwise convolutional weight
+        kernel = kernel.repeat(3, 1, 1, 1)
+        kernel = kernel.cuda()
 
-    return kernel
+        return kernel
 
 def get_motion_filter(kernel_size):
-    # 45 degrees, 135 degrees
-    motion_blur_data = th.tensor([[0.,0.,0.,0.00414365, 0.],
-                                    [0.01104972, 0.16298343, 0.02348066, 0., 0.00414365],
-                                    [0.00690608, 0.13259669, 0.19475138, 0.0980663,  0.],
-                                    [0., 0., 0.03453039, 0.18370166, 0.09530387],
-                                    [0., 0.00552486, 0.,0.01104972, 0.03176796]])
+    with th.no_grad():
+        # 45 degrees, 135 degrees
+        motion_blur_data = th.tensor([[0.,0.,0.,0.00414365, 0.],
+                                        [0.01104972, 0.16298343, 0.02348066, 0., 0.00414365],
+                                        [0.00690608, 0.13259669, 0.19475138, 0.0980663,  0.],
+                                        [0., 0., 0.03453039, 0.18370166, 0.09530387],
+                                        [0., 0.00552486, 0.,0.01104972, 0.03176796]])
 
-    motion_blur_data = motion_blur_data.cuda()
-    motion_blur_data = motion_blur_data / th.sum(motion_blur_data)
+        motion_blur_data = motion_blur_data.cuda()
+        motion_blur_data = motion_blur_data / th.sum(motion_blur_data)
 
-    motion_blur_data = motion_blur_data.view(1, kernel_size, kernel_size)
-    motion_blur_data = motion_blur_data.repeat(3, 1, 1, 1)
-    motion_blur_data = motion_blur_data.cuda()
+        motion_blur_data = motion_blur_data.view(1, kernel_size, kernel_size)
+        motion_blur_data = motion_blur_data.repeat(3, 1, 1, 1)
+        motion_blur_data = motion_blur_data.cuda()
 
-    return motion_blur_data
+        return motion_blur_data
 
-def get_gaussian_filter(kernel_size, sigma):
+def get_saved_kernel(kernel_path):
+    blur_kernel = th.load(kernel_path)
+    return blur_kernel.cuda()
+
+def get_gaussian_filter(kernel_size, sigma, mean=-1):
     """
     Given kernel size, output the blur filter
     """
-    # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
-    x_cord = th.arange(kernel_size)
-    x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
-    y_grid = x_grid.t()
-    xy_grid = th.stack([x_grid, y_grid], dim=-1)
+    with th.no_grad():
+        # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
+        x_cord = th.arange(kernel_size)
+        x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
+        y_grid = x_grid.t()
+        xy_grid = th.stack([x_grid, y_grid], dim=-1)
 
-    mean = (kernel_size - 1)/2.
-    variance = sigma**2.
+        if mean == -1:
+            mean = (kernel_size - 1)/2.
+        variance = sigma**2.
 
-    # Calculate the 2-dimensional gaussian kernel which is
-    # the product of two gaussian distributions for two different
-    # variables (in this case called x and y)
-    gaussian_kernel = (1./(2.*math.pi*variance)) *\
-                    th.exp(
-                        -th.sum((xy_grid - mean)**2., dim=-1) /\
-                        (2*variance)
-                    )
-    # Make sure sum of values in gaussian kernel equals 1.
-    gaussian_kernel = gaussian_kernel / th.sum(gaussian_kernel)
+        # Calculate the 2-dimensional gaussian kernel which is
+        # the product of two gaussian distributions for two different
+        # variables (in this case called x and y)
+        gaussian_kernel = (1./(2.*math.pi*variance)) *\
+                        th.exp(
+                            -th.sum((xy_grid - mean)**2., dim=-1) /\
+                            (2*variance)
+                        )
+        # Make sure sum of values in gaussian kernel equals 1.
+        gaussian_kernel = gaussian_kernel / th.sum(gaussian_kernel)
 
-    # Reshape to 2d depthwise convolutional weight
-    gaussian_kernel = gaussian_kernel.view(1, kernel_size, kernel_size)
+        # Reshape to 2d depthwise convolutional weight
+        gaussian_kernel = gaussian_kernel.view(1, kernel_size, kernel_size)
 
-    # 3 = Num channels
-    gaussian_kernel = gaussian_kernel.repeat(3, 1, 1, 1)
-    gaussian_kernel = gaussian_kernel.cuda()
+        # 3 = Num channels
+        gaussian_kernel = gaussian_kernel.repeat(3, 1, 1, 1)
+        gaussian_kernel = gaussian_kernel.cuda()
 
-    return gaussian_kernel
+        return gaussian_kernel
 
 def get_corrupted_image(image_path):
     """
@@ -193,8 +214,7 @@ def main():
 
     # TODO: Make 0.05 an argument
     std = 0.05
-    blur_kernel = init_blur_kernel(args.kernel_size, args.diffusion_steps, std)
-    # blur_kernel = None
+    blur_kernel = get_no_blur_filter(args.kernel_size)
 
     def cond_fn(x, t, y=None):
         assert y is not None
