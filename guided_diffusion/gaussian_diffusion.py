@@ -242,15 +242,16 @@ class GaussianDiffusion:
             warnings.filterwarnings("ignore", category=UserWarning, module="torch")
             warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
 
-            loss_fn_alex = lpips.LPIPS(net='alex', verbose=False, use_dropout=False)
-            lpips_val = loss_fn_alex(img1_tensor.cpu(), img2_tensor.cpu()).item()
-
-            # PSNR
+            # Make sure the tensor values are clamped at [-1,1]
             img1_tensor_copy = img1_tensor.clone().clamp(-1., 1.)
             img2_tensor_copy = img2_tensor.clone().clamp(-1., 1.)
 
+            # Bring to [0, 1]
             img1, img2 = 0.5 * (img1_tensor_copy + 1), 0.5 * (img2_tensor_copy + 1)
             img1, img2 = img1.clamp(0., 1.), img2.clamp(0., 1.)
+
+            lpips_fn = piqa.LPIPS()
+            lpips_val = lpips_fn(img1.cpu(), img2.cpu()).item()
 
             psnr_fn, ssim_fn = piqa.PSNR(), piqa.SSIM()
             psnr_val = psnr_fn(img1.cpu(), img2.cpu()).item()
@@ -355,13 +356,13 @@ class GaussianDiffusion:
                     self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
                 )
                 if blur_kernel is not None:
-                    pred_At, gradient_At = self._predict_At_from_y(
-                        y=corrupted_image, t=t, x_t=x, A=blur_kernel,
-                        eps=model_output, wandb_log=wandb_log
-                    )
-                    pred_At = process_kernel(pred_At)
+                    # pred_At, gradient_At = self._predict_At_from_y(
+                    #     y=corrupted_image, t=t, x_t=x, A=blur_kernel,
+                    #     eps=model_output, wandb_log=wandb_log
+                    # )
+                    # pred_At = process_kernel(pred_At)
 
-                    # pred_At, gradient_At = blur_kernel, None
+                    pred_At, gradient_At = blur_kernel, None
 
                     pred_yt = process_xstart(
                         # TODO: Check if predicted A_t or blur_kernel
@@ -397,9 +398,9 @@ class GaussianDiffusion:
 
             # Define the blur convolution function
             blur = th.nn.Conv2d(in_channels=channels, out_channels=channels,
-                            kernel_size=kernel_size, groups=channels, bias=False,
-                            padding=kernel_size // 2, device=blur_kernel.device,
-                            padding_mode='reflect')
+                                kernel_size=(kernel_size, kernel_size),
+                                groups=channels, bias=False, padding=0,
+                                stride=1, device=image.device)
 
             blur.weight.data = blur_kernel
             blur.weight.requires_grad = set_gradient
@@ -407,6 +408,25 @@ class GaussianDiffusion:
             # Convolve blur_kernel over image
             output_image = blur(image)
 
+            return output_image
+
+    def transpose_convolve(self, kernel, image, set_gradient=False):
+        with th.enable_grad():
+            channels, kernel_size = image.size() [1], kernel.size() [2]
+
+            # Define the transpose convolution function
+            conv_transposed = th.nn.ConvTranspose2d(in_channels=channels,
+                                                    out_channels=channels,
+                                                    groups=channels,
+                                                    kernel_size=(kernel_size, kernel_size),
+                                                    padding=0, stride=1,
+                                                    bias=False, device=image.device)
+
+            conv_transposed.weight.data = kernel
+            conv_transposed.requires_grad = set_gradient
+
+            # Convolve transpose over the image
+            output_image = conv_transposed(image)
             return output_image
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
@@ -417,7 +437,6 @@ class GaussianDiffusion:
         )
 
     def _predict_yt_from_eps(self, y, t, A, eps):
-        assert y.shape == eps.shape
         A_eps_convolve = self.convolve(A, eps)
         return (
             _extract_into_tensor(self.sqrt_alphas_cumprod, t, y.shape) * y
@@ -447,9 +466,9 @@ class GaussianDiffusion:
             batch_size, channels, kernel_size = x_t.size()[0], x_t.size()[1], A.size()[2]
 
             blur_kernel_A = th.nn.Conv2d(in_channels=channels, out_channels=channels,
-                                         kernel_size=kernel_size, groups=channels, bias=False,
-                                         padding=kernel_size // 2, device=A.device,
-                                         padding_mode='reflect')
+                                         kernel_size=(kernel_size, kernel_size),
+                                         groups=channels, bias=False, padding=0,
+                                         stride=1, device=x_t.device)
 
             # A_copy = A.data.detach().clone()
             blur_kernel_A.weight.data = A.data
@@ -531,11 +550,8 @@ class GaussianDiffusion:
             kernel_mu_convolve = self.convolve(blur_kernel, p_mean_var["mean"])
             kernel_mu_convolve = kernel_mu_convolve - y_t
 
-            # Transpose for cross correlation
-            kernel_tranpose = blur_kernel.transpose(2, 3)
-
             # Analytical gradient wrt x_t
-            gradient_xt = -2 * (self.convolve(kernel_tranpose, kernel_mu_convolve))
+            gradient_xt = -2 * (self.transpose_convolve(blur_kernel, kernel_mu_convolve))
 
             # TODO: scale gradient_At
             gradient = gradient_xt * gradient_scaling
