@@ -10,6 +10,7 @@ import math
 
 import numpy as np
 import torch as th
+from PIL import Image
 import matplotlib.pyplot as plt
 import wandb
 import piqa
@@ -241,11 +242,16 @@ class GaussianDiffusion:
             warnings.filterwarnings("ignore", category=UserWarning, module="torch")
             warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
 
-            loss_fn_alex = lpips.LPIPS(net='alex')
+            loss_fn_alex = lpips.LPIPS(net='alex', verbose=False, use_dropout=False)
             lpips_val = loss_fn_alex(img1_tensor.cpu(), img2_tensor.cpu()).item()
 
             # PSNR
-            img1, img2 = 0.5 * (img1_tensor + 1), 0.5 * (img2_tensor + 1)
+            img1_tensor_copy = img1_tensor.clone().clamp(-1., 1.)
+            img2_tensor_copy = img2_tensor.clone().clamp(-1., 1.)
+
+            img1, img2 = 0.5 * (img1_tensor_copy + 1), 0.5 * (img2_tensor_copy + 1)
+            img1, img2 = img1.clamp(0., 1.), img2.clamp(0., 1.)
+
             psnr_fn, ssim_fn = piqa.PSNR(), piqa.SSIM()
             psnr_val = psnr_fn(img1.cpu(), img2.cpu()).item()
             ssim_val = ssim_fn(img1.cpu(), img2.cpu()).item()
@@ -433,8 +439,8 @@ class GaussianDiffusion:
             log_probability = - th.norm(A_x_convolve - y_t) ** 2
             return log_probability
 
-    def _predict_At_from_y(self, y, t, x_t, A, eps, eta=4e-3, n_steps=100,
-                           lambda_=1e-2, clip_value=1.5, verbose=False, wandb_log=True):
+    def _predict_At_from_y(self, y, t, x_t, A, eps, eta=4e-3, n_steps=200,
+                           lambda_=1e-1, clip_value=1.5, verbose=False, wandb_log=True):
         with th.enable_grad():
             assert y.shape == x_t.shape
 
@@ -450,14 +456,18 @@ class GaussianDiffusion:
             blur_kernel_A.weight.requires_grad = True
 
             # TODO: Tune other adam variables
-            optimizer_A = th.optim.Adam(list(blur_kernel_A.parameters()), lr=eta, weight_decay=lambda_)
+            # optimizer_A = th.optim.Adam(list(blur_kernel_A.parameters()), lr=eta, weight_decay=lambda_)
+            optimizer_A = th.optim.Adam(list(blur_kernel_A.parameters()), lr=eta)
 
             # Optimize A
             loss_values = []
 
             for i in range(n_steps):
                 # Minimize negative log likelihood of y | A_t
+                l1_reg = sum(p.abs().sum() for p in blur_kernel_A.parameters())
+
                 loss = self.blur_log_likelihood(y, t, x_t, blur_kernel_A, eps)
+                loss = loss + lambda_ * l1_reg
                 loss_values.append(loss.item())
                 if verbose:
                     print(f"Timestep #{t}, likelihood: {loss}")
@@ -559,76 +569,94 @@ class GaussianDiffusion:
         )
         return out
 
-    def get_gaussian_filter(self, kernel_size, sigma):
+    def get_gaussian_filter(self, kernel_size, sigma, mean=-1):
         """
         Given kernel size, output the blur filter
         """
+        with th.no_grad():
+            # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
+            x_cord = th.arange(kernel_size)
+            x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
+            y_grid = x_grid.t()
+            xy_grid = th.stack([x_grid, y_grid], dim=-1)
 
-        # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
-        x_cord = th.arange(kernel_size)
-        x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
-        y_grid = x_grid.t()
-        xy_grid = th.stack([x_grid, y_grid], dim=-1)
+            if mean == -1:
+                mean = (kernel_size - 1)/2.
+            variance = sigma**2.
 
-        mean = (kernel_size - 1)/2.
-        variance = sigma**2.
+            # Calculate the 2-dimensional gaussian kernel which is
+            # the product of two gaussian distributions for two different
+            # variables (in this case called x and y)
+            gaussian_kernel = (1./(2.*math.pi*variance)) *\
+                            th.exp(
+                                -th.sum((xy_grid - mean)**2., dim=-1) /\
+                                (2*variance)
+                            )
+            # Make sure sum of values in gaussian kernel equals 1.
+            gaussian_kernel = gaussian_kernel / th.sum(gaussian_kernel)
 
-        # Calculate the 2-dimensional gaussian kernel which is
-        # the product of two gaussian distributions for two different
-        # variables (in this case called x and y)
-        gaussian_kernel = (1./(2.*math.pi*variance)) *\
-                        th.exp(
-                            -th.sum((xy_grid - mean)**2., dim=-1) /\
-                            (2*variance)
-                        )
-        # Make sure sum of values in gaussian kernel equals 1.
-        gaussian_kernel = gaussian_kernel / th.sum(gaussian_kernel)
+            # Reshape to 2d depthwise convolutional weight
+            gaussian_kernel = gaussian_kernel.view(1, kernel_size, kernel_size)
 
-        # Reshape to 2d depthwise convolutional weight
-        gaussian_kernel = gaussian_kernel.view(1, kernel_size, kernel_size)
+            # 3 = Num channels
+            gaussian_kernel = gaussian_kernel.repeat(3, 1, 1, 1)
+            gaussian_kernel = gaussian_kernel.cuda()
 
-        # 3 = Num channels
-        gaussian_kernel = gaussian_kernel.repeat(3, 1, 1, 1)
-        gaussian_kernel = gaussian_kernel.cuda()
-
-        return gaussian_kernel
+            return gaussian_kernel
 
     def get_uniform_filter(self, kernel_size):
         """
         Ground truth uniform kernel
         """
-        uniform_kernel = th.ones(1, kernel_size, kernel_size)
-        uniform_kernel = uniform_kernel / (kernel_size * kernel_size)
-        uniform_kernel = uniform_kernel.repeat(3, 1, 1, 1)
-        uniform_kernel = uniform_kernel.cuda()
+        with th.no_grad():
+            uniform_kernel = th.ones(1, kernel_size, kernel_size)
+            uniform_kernel = uniform_kernel / (kernel_size * kernel_size)
+            uniform_kernel = uniform_kernel.repeat(3, 1, 1, 1)
+            uniform_kernel = uniform_kernel.cuda()
 
-        return uniform_kernel
+            return uniform_kernel
 
-    def get_multi_filter(self, kernel_size, sigma):
-        uniform_kernel = self.get_uniform_filter(kernel_size - 2)
-        gaussian_kernel = self.get_gaussian_filter(kernel_size - 2, sigma)
+    def get_multi_filter(self, kernel_size, sigma1, sigma2):
+        with th.no_grad():
+            mean1, mean2 = 0.0, 1.0
+            gaussian_kernel1 = self.get_gaussian_filter(kernel_size - 2, sigma1, mean1)
+            gaussian_kernel2 = self.get_gaussian_filter(kernel_size - 2, sigma2, mean2)
 
-        padding = gaussian_kernel.shape[-1] - 1
-        multi_kernel = th.conv2d(uniform_kernel, gaussian_kernel,
-                                 padding=padding) [:1]
-        multi_kernel = multi_kernel.permute(1, 0, 2, 3)
-        return multi_kernel
+            padding = gaussian_kernel2.shape[-1] - 1
+            multi_kernel = th.conv2d(gaussian_kernel2, gaussian_kernel1, padding=padding) [:1]
+            multi_kernel = multi_kernel.permute(1, 0, 2, 3)
+
+            return multi_kernel
+
+    def no_blur_filter(self, kernel_size):
+        with th.no_grad():
+            kernel = th.zeros((kernel_size, kernel_size), dtype=th.float32)
+            kernel[kernel_size // 2, kernel_size // 2] = 1.0
+
+            kernel_np = (kernel * 255).clamp(0, 255).to(th.uint8).cpu().numpy()
+
+            # Reshape to 2d depthwise convolutional weight
+            kernel = kernel.view(1, kernel_size, kernel_size)
+            kernel = kernel.repeat(3, 1, 1, 1)
+            kernel = kernel.cuda()
+            return kernel
 
     def get_motion_filter(self, kernel_size):
-        # 45 degrees, 135 degrees
-        motion_blur_data = th.tensor([[0.,0.,0.,0.00414365, 0.],
-                                        [0.01104972, 0.16298343, 0.02348066, 0., 0.00414365],
-                                        [0.00690608, 0.13259669, 0.19475138, 0.0980663,  0.],
-                                        [0., 0., 0.03453039, 0.18370166, 0.09530387],
-                                        [0., 0.00552486, 0.,0.01104972, 0.03176796]])
-        motion_blur_data = motion_blur_data.cuda()
-        motion_blur_data = motion_blur_data / th.sum(motion_blur_data)
+        with th.no_grad():
+            # 45 degrees, 135 degrees
+            motion_blur_data = th.tensor([[0.,0.,0.,0.00414365, 0.],
+                                            [0.01104972, 0.16298343, 0.02348066, 0., 0.00414365],
+                                            [0.00690608, 0.13259669, 0.19475138, 0.0980663,  0.],
+                                            [0., 0., 0.03453039, 0.18370166, 0.09530387],
+                                            [0., 0.00552486, 0.,0.01104972, 0.03176796]])
+            motion_blur_data = motion_blur_data.cuda()
+            motion_blur_data = motion_blur_data / th.sum(motion_blur_data)
 
-        motion_blur_data = motion_blur_data.view(1, kernel_size, kernel_size)
-        motion_blur_data = motion_blur_data.repeat(3, 1, 1, 1)
-        motion_blur_data = motion_blur_data.cuda()
+            motion_blur_data = motion_blur_data.view(1, kernel_size, kernel_size)
+            motion_blur_data = motion_blur_data.repeat(3, 1, 1, 1)
+            motion_blur_data = motion_blur_data.cuda()
 
-        return motion_blur_data
+            return motion_blur_data
     def p_sample(
         self,
         model,
@@ -691,7 +719,8 @@ class GaussianDiffusion:
         if wandb_log:
             # TODO Modify for Gaussian case
             kernel_size, batch_size = out["pred_At"].size()[-1], x.size()[0]
-            ground_truth_kernel = self.get_motion_filter(kernel_size)
+            ground_truth_kernel = self.no_blur_filter(kernel_size)
+            # ground_truth_kernel = self.get_multi_filter(kernel_size, 1.0, 2.0)
 
             psnr_val, ssim_val, lpips_val = self.metrics(self.convolve(out["pred_At"], out["pred_xstart"]), corrupted_image)
 
@@ -704,7 +733,6 @@ class GaussianDiffusion:
                        "Mean cosine similarity": th.mean(cosine_kernels)})
 
         if t[0].item() % 100 == 0:
-            from PIL import Image
             mu = ((out["mean"] + 1) * 127.5).clamp(0,255).to(th.uint8)
             mu = mu.permute(0,2,3,1)
             x_prev = ((sample + 1) * 127.5).clamp(0,255).to(th.uint8)
@@ -841,8 +869,7 @@ class GaussianDiffusion:
             img = noise
         else:
             img = th.randn(*shape, device=device)
-        # indices = list(range(self.num_timesteps))[::-1]
-        indices = list(range(26))[::-1]
+        indices = list(range(self.num_timesteps))[::-1]
 
         if progress:
             # Lazy import so that we don't depend on tqdm.
@@ -1017,8 +1044,7 @@ class GaussianDiffusion:
             img = noise
         else:
             img = th.randn(*shape, device=device)
-        # indices = list(range(self.num_timesteps))[::-1]
-        indices = list(range(76))[::-1]
+        indices = list(range(self.num_timesteps))[::-1]
 
         if progress:
             # Lazy import so that we don't depend on tqdm.
