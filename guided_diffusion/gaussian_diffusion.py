@@ -235,6 +235,25 @@ class GaussianDiffusion:
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
+    def dynamic_thresholding(self, x, p=0.995, c=1.7):
+        """
+        Dynamic thresholding, a diffusion sampling technique from Imagen (https://arxiv.org/abs/2205.11487)
+        to leverage high guidance weights and generating more photorealistic and detailed images
+        than previously was possible based on x.clamp(-1, 1) vanilla clipping or static thresholding
+
+        p — percentile determine relative value for clipping threshold for dynamic compression,
+            helps prevent oversaturation recommend values [0.96 — 0.99]
+
+        c — absolute hard clipping of value for clipping threshold for dynamic compression,
+            helps prevent undersaturation and low contrast issues; recommend values [1.5 — 2.]
+        """
+        x_shapes = x.shape
+        s = th.quantile(x.abs().reshape(x_shapes[0], -1), p, dim=-1)
+        s = th.clamp(s, min=1, max=c)
+        x_compressed = th.clip(x.reshape(x_shapes[0], -1).T, -s, s) / s
+        x_compressed = x_compressed.T.reshape(x_shapes)
+        return x_compressed
+
     def metrics(self, img1_tensor, img2_tensor):
         with th.no_grad():
             # LPIPS
@@ -264,7 +283,9 @@ class GaussianDiffusion:
 
     def p_mean_variance(
         self, model, x, t, clip_denoised=True, denoised_fn=None,
-        model_kwargs=None, blur_kernel=None, corrupted_image=None, wandb_log=True
+        model_kwargs=None, blur_kernel=None, corrupted_image=None,
+        dynamic_thresholding_p=0.99, dynamic_thresholding_c=1.7,
+        wandb_log=True
     ):
         """
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
@@ -328,7 +349,8 @@ class GaussianDiffusion:
             if denoised_fn is not None:
                 x = denoised_fn(x)
             if clip_denoised:
-                return x.clamp(-1, 1)
+                x = self.dynamic_thresholding(x, p=dynamic_thresholding_p, c=dynamic_thresholding_c)
+                return x#x.clamp(-1, 1)
             return x
         def process_kernel(A):
             sum_kernel = th.sum(A, dim=(1, 2, 3), keepdim=True)
@@ -458,11 +480,20 @@ class GaussianDiffusion:
             log_probability = - th.norm(A_x_convolve - y_t) ** 2
             return log_probability
 
-    def _predict_At_from_y(self, y, t, x_t, A, eps, eta=4e-3, n_steps=200,
-                           lambda_=1e-1, clip_value=1.5, verbose=False, wandb_log=True):
-        with th.enable_grad():
-            assert y.shape == x_t.shape
+    def iteration_scheduler(self, t, t_start, max_iterations=200, min_iterations=50):
+        # Linearly increase the number of iterations as t decreases
+        if t > t_start:
+            iterations = max_iterations
+        else:
+            iterations = min_iterations + (max_iterations - min_iterations) * ((t_start - t) / t_start)
 
+        return int(iterations)
+
+    def _predict_At_from_y(self, y, t, x_t, A, eps, eta=4e-3, n_steps=200,
+                           lambda_=1e-1, clip_value=1.5, verbose=False,
+                           wandb_log=True):
+
+        with th.enable_grad():
             batch_size, channels, kernel_size = x_t.size()[0], x_t.size()[1], A.size()[2]
 
             blur_kernel_A = th.nn.Conv2d(in_channels=channels, out_channels=channels,
@@ -475,25 +506,26 @@ class GaussianDiffusion:
             blur_kernel_A.weight.requires_grad = True
 
             # TODO: Tune other adam variables
-            # optimizer_A = th.optim.Adam(list(blur_kernel_A.parameters()), lr=eta, weight_decay=lambda_)
-            optimizer_A = th.optim.Adam(list(blur_kernel_A.parameters()), lr=eta)
+            optimizer_A = th.optim.Adam(list(blur_kernel_A.parameters()), lr=eta, weight_decay=lambda_)
 
             # Optimize A
             loss_values = []
 
-            for i in range(n_steps):
-                # Minimize negative log likelihood of y | A_t
-                l1_reg = sum(p.abs().sum() for p in blur_kernel_A.parameters())
+            n_steps_scheduler = self.iteration_scheduler(t[0].item(),
+                                                        self.num_timesteps,
+                                                        max_iterations=n_steps)
 
+            for i in range(n_steps_scheduler):
+                # Minimize negative log likelihood of y | A_t
                 loss = self.blur_log_likelihood(y, t, x_t, blur_kernel_A, eps)
-                loss = loss + lambda_ * l1_reg
                 loss_values.append(loss.item())
                 if verbose:
                     print(f"Timestep #{t}, likelihood: {loss}")
                 (-loss).backward()
 
                 # Clip gradients
-                th.nn.utils.clip_grad_value_(blur_kernel_A.parameters(), clip_value=clip_value)
+                th.nn.utils.clip_grad_value_(blur_kernel_A.parameters(),
+                                             clip_value=clip_value)
 
                 # Perform gradient descent
                 optimizer_A.step()
@@ -504,7 +536,9 @@ class GaussianDiffusion:
             print(f"Timestep #{t[0].item()}, average likelihood: {np.mean(loss_values)}")
 
             # Compute gradient wrt A_t (required for guidance)
-            gradient_At = th.autograd.grad(self.blur_log_likelihood(y, t, x_t, blur_kernel_A, eps), blur_kernel_A.weight) [0]
+            gradient_At = th.autograd.grad(self.blur_log_likelihood(y, t, x_t, blur_kernel_A, eps),
+                                           blur_kernel_A.weight) [0]
+
             gradient_At = th.clamp(gradient_At, min=-clip_value, max=clip_value)
 
             # A is detached from computational graph
@@ -634,7 +668,7 @@ class GaussianDiffusion:
 
     def get_multi_filter(self, kernel_size, sigma1, sigma2):
         with th.no_grad():
-            mean1, mean2 = 0.0, 1.0
+            mean1, mean2 = 3.0, 1.0
             gaussian_kernel1 = self.get_gaussian_filter(kernel_size - 2, sigma1, mean1)
             gaussian_kernel2 = self.get_gaussian_filter(kernel_size - 2, sigma2, mean2)
 
@@ -735,7 +769,8 @@ class GaussianDiffusion:
         if wandb_log:
             # TODO Modify for Gaussian case
             kernel_size, batch_size = out["pred_At"].size()[-1], x.size()[0]
-            ground_truth_kernel = self.no_blur_filter(kernel_size)
+            # ground_truth_kernel = self.get_gaussian_filter(kernel_size, sigma=15)
+            ground_truth_kernel = self.get_multi_filter(kernel_size, sigma1=10, sigma2=10)
             # ground_truth_kernel = self.get_multi_filter(kernel_size, 1.0, 2.0)
 
             psnr_val, ssim_val, lpips_val = self.metrics(self.convolve(out["pred_At"], out["pred_xstart"]), corrupted_image)

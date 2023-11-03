@@ -83,16 +83,11 @@ def transform_img(img_path, permute=True, expand_range=False):
 def measure_eval(image_path1, image_path2):
     warnings.filterwarnings("ignore", category=UserWarning, module="torch")
     warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
-
-    # [0,1] float tensor
     img1_tensor = transform_img(image_path1, permute=False).unsqueeze(dim=0).cpu()
     img2_tensor = transform_img(image_path2, permute=False).unsqueeze(dim=0).cpu()
 
-    img1, img2 = (2 * img1_tensor) - 1, (2 * img2_tensor) - 1
-
-    # PSNR
-    lpips_alex_fn = lpips.LPIPS(net='alex')
-    lpips_val = lpips_alex_fn(img1, img2).item()
+    lpips_fn = piqa.LPIPS()
+    lpips_val = lpips_fn(img1_tensor, img2_tensor).item()
 
     # PSNR, SSIM
     psnr_fn, ssim_fn = piqa.PSNR(), piqa.SSIM()
@@ -104,7 +99,9 @@ def measure_eval(image_path1, image_path2):
     print(f"SSIM between {image_path1} and {image_path2} is: {ssim_val}")
     print(f"LPIPS between {image_path1} and {image_path2} is: {lpips_val}\n")
 
-    # return psnr_val, ssim_val, lpips_val
+    # Restore warnings (if needed)
+    warnings.resetwarnings()
+    return psnr_val, ssim_val, lpips_val
 
 # Create parser for different utility tasks
 util_parser = load_parser()
