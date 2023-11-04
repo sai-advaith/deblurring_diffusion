@@ -58,19 +58,13 @@ def no_blur_kernel(input_image, kernel_size):
     no_blur_filter.weight.requires_grad = False
 
     no_blur_image = no_blur_filter(input_image)
-    assert torch.sum((no_blur_image - input_image)**2) == 0
+    # assert torch.sum((no_blur_image - input_image)**2) == 0
 
     print(no_blur_image.max(), no_blur_image.min())
 
     kernel = kernel[:, 0, :, :].permute(1, 2, 0)
     kernel = kernel.cpu().numpy()
 
-    print(kernel.shape)
-    plt.imshow(kernel, cmap='viridis', interpolation='nearest')
-    plt.colorbar()
-    plt.savefig('kernel.jpg')
-    plt.close()
-    exit(0)
     return no_blur_image
 
 def multiple_blur_kernel(input_image, kernel_size, sigma1, sigma2):

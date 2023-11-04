@@ -378,14 +378,19 @@ class GaussianDiffusion:
                     self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
                 )
                 if blur_kernel is not None:
-                    # pred_At, gradient_At = self._predict_At_from_y(
-                    #     y=corrupted_image, t=t, x_t=x, A=blur_kernel,
-                    #     eps=model_output, wandb_log=wandb_log
-                    # )
-                    # pred_At = process_kernel(pred_At)
+                    ######
+                    # COMMENT OUT FOR ADIR ONLY
+                    pred_At, gradient_At = self._predict_At_from_y(
+                        y=corrupted_image, t=t, x_t=x, A=blur_kernel,
+                        eps=model_output, wandb_log=wandb_log
+                    )
+                    pred_At = process_kernel(pred_At)
+                    ######
 
-                    pred_At, gradient_At = blur_kernel, None
-
+                    ######
+                    # UNCOMMENT FOR ADIR ONLY
+                    # pred_At, gradient_At = blur_kernel, None
+                    ######
                     pred_yt = process_xstart(
                         # TODO: Check if predicted A_t or blur_kernel
                         self._predict_yt_from_eps(y=corrupted_image, t=t,
@@ -765,6 +770,8 @@ class GaussianDiffusion:
                     cond_fn, out, x, t, model_kwargs=model_kwargs
                 )
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        if t[0].item() == 0:
+            print(out["pred_At"])
 
         if wandb_log:
             # TODO Modify for Gaussian case

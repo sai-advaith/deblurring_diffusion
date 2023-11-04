@@ -38,7 +38,7 @@ def load(image_path, image_save_path):
 
     for i in range(image_val.shape[0]):
         im = Image.fromarray(image_val[i])
-        im.save(f'{image_save_path}_{i}.jpg')
+        im.save(f'{image_save_path}')
 
 def rescale(image_path):
     img = Image.open(image_path)
@@ -80,12 +80,27 @@ def transform_img(img_path, permute=True, expand_range=False):
 
     return img_tensor
 
+def resize(img_tensor, reshape_size):
+    img_max, img_min = img_tensor.max(), img_tensor.min()
+    resized_tensor = F.interpolate(img_tensor, reshape_size, mode='bicubic')
+    return resized_tensor.clamp(img_min, img_max)
+
 def measure_eval(image_path1, image_path2):
     warnings.filterwarnings("ignore", category=UserWarning, module="torch")
     warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
     img1_tensor = transform_img(image_path1, permute=False).unsqueeze(dim=0).cpu()
     img2_tensor = transform_img(image_path2, permute=False).unsqueeze(dim=0).cpu()
 
+    if img1_tensor.size() != img2_tensor.size():
+        # Resize the smaller image
+        if img1_tensor.numel() > img2_tensor.numel():
+            img2_tensor = resize(img2_tensor, img1_tensor.size()[-2:])
+        else:
+            img1_tensor = resize(img1_tensor, img2_tensor.size()[-2:])
+
+    assert img1_tensor.size() == img2_tensor.size()
+
+    # LPIPS
     lpips_fn = piqa.LPIPS()
     lpips_val = lpips_fn(img1_tensor, img2_tensor).item()
 

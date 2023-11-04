@@ -38,9 +38,15 @@ def get_no_blur_filter(kernel_size):
 
         return kernel
 
+def load_kernel_path(kernel_path):
+    with th.no_grad():
+        kernel = th.load(kernel_path)
+        kernel = kernel.cuda()
+        return kernel
+
 def get_multi_filter(kernel_size, sigma1, sigma2):
     with th.no_grad():
-        mean1, mean2 = 0.0, 1.0
+        mean1, mean2 = 3.0, 1.0
         gaussian_kernel1 = get_gaussian_filter(kernel_size - 2, sigma1, mean1)
         gaussian_kernel2 = get_gaussian_filter(kernel_size - 2, sigma2, mean2)
 
@@ -62,7 +68,7 @@ def init_blur_kernel(kernel_size, timesteps, std):
 
     plt.imshow(cosine_kernels.cpu().numpy()[0], cmap='viridis', interpolation='nearest')
     plt.colorbar()
-    plt.savefig(f'imgs/cosine_similarity_kernels/cosine_similarity_kernels_{timesteps}.jpg')
+    plt.savefig(f'/home/sanketh/denoising_diffusion/imgs/cosine_similarity_kernels/cosine_similarity_kernels_{timesteps}.jpg')
     plt.close()
 
     return kernel
@@ -214,7 +220,11 @@ def main():
 
     # TODO: Make 0.05 an argument
     std = 0.05
-    blur_kernel = get_no_blur_filter(args.kernel_size)
+    # blur_kernel = init_blur_kernel(args.kernel_size, args.diffusion_steps, std)
+    blur_kernel = load_kernel_path('/home/sanketh/denoising_diffusion/results/multi_kernel/example_1/final_predict_kernel.pt')
+    # blur_kernel = get_gaussian_filter(args.kernel_size, sigma=15)
+    # blur_kernel = get_multi_filter(args.kernel_size, 10, 10)
+    # blur_kernel = get_uniform_filter(args.kernel_size)
 
     def cond_fn(x, t, y=None):
         assert y is not None
