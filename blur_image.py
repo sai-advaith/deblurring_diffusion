@@ -11,16 +11,19 @@ import argparse
 
 random.seed(42)
 
+# Parser to configure the type of kernel
 def create_parser():
     parser = argparse.ArgumentParser()
 
     # Type of blur kernel and size
     parser.add_argument("--gaussian", action="store_true")
     parser.add_argument("--uniform", action="store_true")
-    parser.add_argument("--kernel_size", type=int, help="size of kernel to convolve")
     parser.add_argument("--motion", action="store_true")
     parser.add_argument("--multi", action="store_true")
     parser.add_argument("--no_blur", action="store_true")
+
+    # Kernel size
+    parser.add_argument("--kernel_size", type=int, help="size of kernel to convolve")
 
     # Image paths
     parser.add_argument("--load_img_path", help="image path to load image")
@@ -36,6 +39,7 @@ def create_parser():
     parser.add_argument("--batch_path", help="batch of images generated path")
     return parser
 
+# Delta function as the kernel
 def no_blur_kernel(input_image, kernel_size):
     channels = input_image.size() [0]
 
@@ -49,22 +53,20 @@ def no_blur_kernel(input_image, kernel_size):
     kernel = kernel.repeat(channels, 1, 1, 1)
     kernel = kernel.cuda()
 
+    # Create pytorch object
     no_blur_filter = torch.nn.Conv2d(in_channels=channels, out_channels=channels,
                                      kernel_size=(kernel_size, kernel_size),
                                      groups=channels, bias=False, padding=0,
                                      stride=1, device=input_image.device)
 
+    # Assign previous kernel as the weights for the object
     no_blur_filter.weight.data = kernel
     no_blur_filter.weight.requires_grad = False
 
     no_blur_image = no_blur_filter(input_image)
-    # assert torch.sum((no_blur_image - input_image)**2) == 0
-
-    print(no_blur_image.max(), no_blur_image.min())
 
     kernel = kernel[:, 0, :, :].permute(1, 2, 0)
     kernel = kernel.cpu().numpy()
-
     return no_blur_image
 
 def multiple_blur_kernel(input_image, kernel_size, sigma1, sigma2):
@@ -115,7 +117,6 @@ def multiple_blur_kernel(input_image, kernel_size, sigma1, sigma2):
     k3 = torch.conv2d(gaussian_kernel2, gaussian_kernel1,
                         padding=padding)[:1]
     k3 = k3.permute(1, 0, 2, 3)
-    print(k3)
     channels, size = k3.size() [0], k3.size()[-1]
     multiple_kernel = torch.nn.Conv2d(in_channels=channels, out_channels=channels,
                                       kernel_size=(kernel_size, kernel_size),
@@ -127,6 +128,7 @@ def multiple_blur_kernel(input_image, kernel_size, sigma1, sigma2):
 
     output_image = multiple_kernel(input_image) * 255
 
+    # Measurement noise added
     measurement_noise = torch.normal(0, 10, size=output_image.size())
     measurement_noise = measurement_noise.cuda()
 
@@ -137,6 +139,7 @@ def multiple_blur_kernel(input_image, kernel_size, sigma1, sigma2):
     return output_image
 
 def uniform_blur_filter(input_image, kernel_size):
+    # Create a uniform blur filter
     kernel = torch.ones(1, 1, kernel_size, kernel_size)
     kernel = kernel / (kernel_size * kernel_size)
 
@@ -146,7 +149,6 @@ def uniform_blur_filter(input_image, kernel_size):
     kernel = kernel.view(1, kernel_size, kernel_size)
     kernel = kernel.repeat(channels, 1, 1, 1)
     kernel = kernel.cuda()
-    print(kernel)
 
     uniform_filter = torch.nn.Conv2d(in_channels=channels, out_channels=channels,
                                      kernel_size=(kernel_size, kernel_size),
@@ -158,6 +160,7 @@ def uniform_blur_filter(input_image, kernel_size):
     uniform_filter.weight.requires_grad = False
     output_image = uniform_filter(input_image) * 255
 
+    # Measurement noise added
     measurement_noise = torch.normal(0, 10, size=output_image.size())
     measurement_noise = measurement_noise.cuda()
 
@@ -194,8 +197,6 @@ def gaussian_blur_filter(input_image, kernel_size, sigma):
     gaussian_kernel = gaussian_kernel.view(1, kernel_size, kernel_size)
     gaussian_kernel = gaussian_kernel.repeat(channels, 1, 1, 1)
     gaussian_kernel = gaussian_kernel.cuda()
-    print(gaussian_kernel)
-    print(gaussian_kernel.size())
 
     gaussian_filter = torch.nn.Conv2d(in_channels=channels, out_channels=channels,
                                       kernel_size=(kernel_size, kernel_size),
@@ -207,6 +208,7 @@ def gaussian_blur_filter(input_image, kernel_size, sigma):
     gaussian_filter.weight.requires_grad = False
     output_image = gaussian_filter(input_image) * 255
 
+    # Measurement noise added
     measurement_noise = torch.normal(0, 10, size=output_image.size())
     measurement_noise = measurement_noise.cuda()
 
@@ -218,6 +220,7 @@ def gaussian_blur_filter(input_image, kernel_size, sigma):
     return output_image
 
 def motion_blur_filter(input_image):
+    # Use custom motion blur
     channels, kernel_size = input_image.size() [0], 5
 
     # 45 degrees, 135 degrees
@@ -232,8 +235,8 @@ def motion_blur_filter(input_image):
     motion_blur_data = motion_blur_data.view(1, kernel_size, kernel_size)
     motion_blur_data = motion_blur_data.repeat(channels, 1, 1, 1)
     motion_blur_data = motion_blur_data.cuda()
-    print(motion_blur_data.size())
 
+    # Save weights in the object
     motion_blur_filter = torch.nn.Conv2d(in_channels=channels, out_channels=channels,
                                          kernel_size=(kernel_size, kernel_size),
                                          groups=channels, bias=False, padding=0,
@@ -244,6 +247,7 @@ def motion_blur_filter(input_image):
     motion_blur_filter.weight.requires_grad = False
     output_image = motion_blur_filter(input_image) * 255
 
+    # Measurement noise added
     measurement_noise = torch.normal(0, 10, size=output_image.size())
     measurement_noise = measurement_noise.cuda()
 
@@ -255,6 +259,9 @@ def motion_blur_filter(input_image):
     return output_image
 
 def batch_process(batch_path, blur_function, positional_arguments):
+    """
+    Blur images in batches ie blur multiple images at once using the same blur kernel type
+    """
     batch_images = np.load(batch_path) ['arr_0']
     blurred_images = []
     for i in range(batch_images.shape[0]):
@@ -292,8 +299,10 @@ if args.load_img_path is not None:
     # Apply transformation
     img_tensor = transform(img).cuda()
 
-
+# Kernel size
 kernel_size = args.kernel_size
+
+# Create a kernel based on the input argument
 if args.gaussian:
     if args.batch:
         noisy_tensor = batch_process(args.batch_path, gaussian_blur_filter, [kernel_size, args.sigma])
@@ -317,19 +326,15 @@ elif args.multi:
 elif args.no_blur:
     noisy_tensor = no_blur_kernel(img_tensor, args.kernel_size)
     noisy_tensor = noisy_tensor.unsqueeze(dim=0)
-
 else:
-    NotImplementedError("Blur does not exist")
+    NotImplementedError("Blur Kernel does not exist")
 
-print(noisy_tensor.size())
+
 noisy_tensor = noisy_tensor.permute(0, 2, 3, 1)
 noisy_tensor = noisy_tensor.cpu().numpy() * 255
 noisy_tensor = noisy_tensor.astype(np.uint8)
 
-print(noisy_tensor.max(), noisy_tensor.min())
-
-print(noisy_tensor.shape)
-
+# Save
 for i in range(noisy_tensor.shape[0]):
     im = Image.fromarray(noisy_tensor[i])
     if args.save_img_path is None:
@@ -340,4 +345,3 @@ for i in range(noisy_tensor.shape[0]):
 
     img_copy = Image.open(img_save_path)
     img_copy_tensor = transform(img_copy).cuda()
-    print(img_copy_tensor.size())
