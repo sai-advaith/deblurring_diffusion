@@ -26,51 +26,13 @@ from guided_diffusion.script_util import (
     add_dict_to_argparser,
     args_to_dict,
 )
-def get_no_blur_filter(kernel_size):
-    with th.no_grad():
-        kernel = th.zeros((kernel_size, kernel_size), dtype=th.float32)
-        kernel[kernel_size // 2, kernel_size // 2] = 1.0
 
-        # Reshape to 2d depthwise convolutional weight
-        kernel = kernel.view(1, kernel_size, kernel_size)
-        kernel = kernel.repeat(3, 1, 1, 1)
-        kernel = kernel.cuda()
-
-        return kernel
-
-def load_kernel_path(kernel_path):
-    with th.no_grad():
-        kernel = th.load(kernel_path)
-        kernel = kernel.cuda()
-        return kernel
-
-def get_multi_filter(kernel_size, sigma1, sigma2):
-    with th.no_grad():
-        mean1, mean2 = 3.0, 1.0
-        gaussian_kernel1 = get_gaussian_filter(kernel_size - 2, sigma1, mean1)
-        gaussian_kernel2 = get_gaussian_filter(kernel_size - 2, sigma2, mean2)
-
-        padding = gaussian_kernel2.shape[-1] - 1
-        multi_kernel = th.conv2d(gaussian_kernel2, gaussian_kernel1, padding=padding) [:1]
-        multi_kernel = multi_kernel.permute(1, 0, 2, 3)
-        return multi_kernel
-
-def init_blur_kernel(kernel_size, timesteps, std):
+def init_blur_kernel(kernel_size, std):
     """
     Initialize with a smooth / uniform operator
     """
     kernel_uniform = get_uniform_filter(kernel_size)
     kernel = kernel_uniform + th.randn_like(kernel_uniform) * std
-    print(kernel)
-
-    cosine_similarity = th.nn.CosineSimilarity(dim=0, eps=1e-6)
-    cosine_kernels = cosine_similarity(kernel, kernel_uniform)
-
-    plt.imshow(cosine_kernels.cpu().numpy()[0], cmap='viridis', interpolation='nearest')
-    plt.colorbar()
-    plt.savefig(f'/home/sanketh/denoising_diffusion/imgs/cosine_similarity_kernels/cosine_similarity_kernels_{timesteps}.jpg')
-    plt.close()
-
     return kernel
 
 def get_uniform_filter(kernel_size):
@@ -83,63 +45,6 @@ def get_uniform_filter(kernel_size):
         kernel = kernel.cuda()
 
         return kernel
-
-def get_motion_filter(kernel_size):
-    with th.no_grad():
-        # 45 degrees, 135 degrees
-        motion_blur_data = th.tensor([[0.,0.,0.,0.00414365, 0.],
-                                        [0.01104972, 0.16298343, 0.02348066, 0., 0.00414365],
-                                        [0.00690608, 0.13259669, 0.19475138, 0.0980663,  0.],
-                                        [0., 0., 0.03453039, 0.18370166, 0.09530387],
-                                        [0., 0.00552486, 0.,0.01104972, 0.03176796]])
-
-        motion_blur_data = motion_blur_data.cuda()
-        motion_blur_data = motion_blur_data / th.sum(motion_blur_data)
-
-        motion_blur_data = motion_blur_data.view(1, kernel_size, kernel_size)
-        motion_blur_data = motion_blur_data.repeat(3, 1, 1, 1)
-        motion_blur_data = motion_blur_data.cuda()
-
-        return motion_blur_data
-
-def get_saved_kernel(kernel_path):
-    blur_kernel = th.load(kernel_path)
-    return blur_kernel.cuda()
-
-def get_gaussian_filter(kernel_size, sigma, mean=-1):
-    """
-    Given kernel size, output the blur filter
-    """
-    with th.no_grad():
-        # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
-        x_cord = th.arange(kernel_size)
-        x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
-        y_grid = x_grid.t()
-        xy_grid = th.stack([x_grid, y_grid], dim=-1)
-
-        if mean == -1:
-            mean = (kernel_size - 1)/2.
-        variance = sigma**2.
-
-        # Calculate the 2-dimensional gaussian kernel which is
-        # the product of two gaussian distributions for two different
-        # variables (in this case called x and y)
-        gaussian_kernel = (1./(2.*math.pi*variance)) *\
-                        th.exp(
-                            -th.sum((xy_grid - mean)**2., dim=-1) /\
-                            (2*variance)
-                        )
-        # Make sure sum of values in gaussian kernel equals 1.
-        gaussian_kernel = gaussian_kernel / th.sum(gaussian_kernel)
-
-        # Reshape to 2d depthwise convolutional weight
-        gaussian_kernel = gaussian_kernel.view(1, kernel_size, kernel_size)
-
-        # 3 = Num channels
-        gaussian_kernel = gaussian_kernel.repeat(3, 1, 1, 1)
-        gaussian_kernel = gaussian_kernel.cuda()
-
-        return gaussian_kernel
 
 def get_corrupted_image(image_path):
     """
@@ -157,6 +62,9 @@ def get_corrupted_image(image_path):
     return img_tensor.unsqueeze(dim=0)
 
 def get_corrupted_batch(data_dir, idx_low, idx_high, image_path=None):
+    """
+    Load corrupted images
+    """
     transform = transforms.Compose([
         transforms.ToTensor(),
     ])
@@ -164,15 +72,11 @@ def get_corrupted_batch(data_dir, idx_low, idx_high, image_path=None):
     # Load images as batch
     images = []
     for i in range(idx_low, idx_high+1):
-        image_path_i = f"{data_dir}/blur_{i}.jpg"
+        image_path_i = f"{data_dir}/{image_path}_{i}.jpg"
         img_i = Image.open(image_path_i)
         img_tensor_i = transform(img_i).to(dist_util.dev())
         img_tensor_i = (img_tensor_i * 2) - 1
         images.append(img_tensor_i)
-
-    # # TODO: Remove this, only for experimentation purposes
-    # if image_path is not None:
-    #     images.append(get_corrupted_image(image_path).squeeze(dim=0))
 
     return th.stack(images, dim=0)
 
@@ -208,6 +112,7 @@ def main():
     classifier.eval()
     logger.log("classifer loaded")
 
+    # Make sure nothing is off
     assert args.batch_load == args.batch_size == args.num_samples
 
     # Creating uniform blur kernel of size kernel size x kernel size
@@ -217,14 +122,9 @@ def main():
         corrupted_image = get_corrupted_batch(args.data_dir, args.idx_low,
                                               args.idx_high, args.image_path)
 
-
-    # TODO: Make 0.05 an argument
-    std = 0.05
-    # blur_kernel = init_blur_kernel(args.kernel_size, args.diffusion_steps, std)
-    blur_kernel = load_kernel_path('/home/sanketh/denoising_diffusion/results/multi_kernel/example_1/final_predict_kernel.pt')
-    # blur_kernel = get_gaussian_filter(args.kernel_size, sigma=15)
-    # blur_kernel = get_multi_filter(args.kernel_size, 10, 10)
-    # blur_kernel = get_uniform_filter(args.kernel_size)
+    # Measurement noise for initialization
+    std = args.init_std
+    blur_kernel = init_blur_kernel(args.kernel_size, args.diffusion_steps, std)
 
     def cond_fn(x, t, y=None):
         assert y is not None
@@ -262,6 +162,7 @@ def main():
                 device=dist_util.dev(),
             )
         else:
+            wandb_project_info = (args.wandb_username, args.wandb_project_name, args.wandb_run_name)
             sample = sample_fn(
                 model_fn,
                 (args.batch_size, 3, args.image_size, args.image_size),
@@ -274,7 +175,8 @@ def main():
                 corrupted_image=corrupted_image,
                 device=dist_util.dev(),
                 gradient_scaling=args.classifier_scale,
-                wandb_log=args.wandb_log
+                wandb_log=args.wandb_log,
+                wandb_project_info=wandb_project_info,
             )
         # Back to [0, 255] range
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
@@ -289,6 +191,7 @@ def main():
         all_labels.extend([labels.cpu().numpy() for labels in gathered_labels])
         logger.log(f"created {len(all_images) * args.batch_size} samples")
 
+    # Save images
     arr = np.concatenate(all_images, axis=0)
     arr = arr[: args.num_samples]
     label_arr = np.concatenate(all_labels, axis=0)
@@ -319,7 +222,11 @@ def create_argparser():
         idx_high=-1,
         data_dir=None,
         wandb_log=False,
-        gpu_device_num=0
+        wandb_username="",
+        wandb_project_name="",
+        wandb_run_name="",
+        gpu_device_num=0,
+        init_std=0.05,
     )
     defaults.update(model_and_diffusion_defaults())
     defaults.update(classifier_defaults())

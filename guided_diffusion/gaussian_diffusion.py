@@ -314,6 +314,11 @@ class GaussianDiffusion:
             clip_denoised.
         :param model_kwargs: if not None, a dict of extra keyword arguments to
             pass to the model. This can be used for conditioning.
+        :param dynamic_thresholding_p, dynamic_thresholding_c: thresholding to
+        make sure the predicted image is between 0 and 1
+        :param wandb_log: log loss to wandb
+        :param blur_kernel: kernel being predicted
+        :param corrupted_image: input corrupted image
         :return: a dict with the following keys:
                  - 'mean': the model mean output.
                  - 'variance': the model variance output.
@@ -363,7 +368,7 @@ class GaussianDiffusion:
                 x = denoised_fn(x)
             if clip_denoised:
                 x = self.dynamic_thresholding(x, p=dynamic_thresholding_p, c=dynamic_thresholding_c)
-                return x#x.clamp(-1, 1)
+                return x
             return x
 
         if self.model_mean_type == ModelMeanType.PREVIOUS_X:
@@ -379,21 +384,12 @@ class GaussianDiffusion:
                     self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
                 )
                 if blur_kernel is not None:
-                    ######
-                    # COMMENT OUT FOR ADIR ONLY
                     pred_At = self._predict_At_from_y(
                         y=corrupted_image, t=t, x_t=x, A=blur_kernel,
                         eps=model_output, wandb_log=wandb_log
                     )
                     pred_At = self.process_kernel(pred_At)
-                    ######
-
-                    ######
-                    # UNCOMMENT FOR ADIR ONLY
-                    # pred_At = blur_kernel, None
-                    ######
                     pred_yt = process_xstart(
-                        # TODO: Check if predicted A_t or blur_kernel
                         self._predict_yt_from_eps(y=corrupted_image, t=t,
                                                   A=pred_At, eps=model_output)
                     )
@@ -439,6 +435,9 @@ class GaussianDiffusion:
             return output_image
 
     def transpose_convolve(self, kernel, image, set_gradient=False):
+        """
+        Utility function to create a transpose kernel using the data in kernel parameter
+        """
         with th.enable_grad():
             channels, kernel_size = image.size() [1], kernel.size() [2]
 
@@ -472,6 +471,9 @@ class GaussianDiffusion:
         )
 
     def blur_log_likelihood(self, y, t, x, kernel, eps):
+        """
+        Compute fidelity between denoised image (kernel * x) and corrupted image y
+        """
         with th.enable_grad():
             # Convolution outputs
             A_x_convolve = kernel(x)
@@ -487,6 +489,10 @@ class GaussianDiffusion:
             return log_probability
 
     def iteration_scheduler(self, t, t_start, max_iterations=200, min_iterations=50):
+        """
+        Scheduler to optimize the kernel very little at first.
+        Once the image is getting more coherent, we run multiple iterations of kernel optimization
+        """
         # Linearly increase the number of iterations as t decreases
         if t > t_start:
             iterations = max_iterations
@@ -496,39 +502,36 @@ class GaussianDiffusion:
         return int(iterations)
 
     def _predict_At_from_y(self, y, t, x_t, A, eps, eta=4e-3, n_steps=200,
-                           lambda_=1.5e+1, clip_value=1.5, verbose=False,
-                           wandb_log=True):
-
+                           lambda_=1.5e+1, clip_value=1.5, wandb_log=True):
+        """
+        Use the corrupted image and diffusion variable x_t to optimize the blur kernel
+        using (||x_t * A - y||_2)^2
+        """
         with th.enable_grad():
             batch_size, channels, kernel_size = x_t.size()[0], x_t.size()[1], A.size()[2]
 
+            # Initialize the blur kernel using A
             blur_kernel_A = th.nn.Conv2d(in_channels=channels, out_channels=channels,
                                          kernel_size=(kernel_size, kernel_size),
                                          groups=channels, bias=False, padding=kernel_size // 2,
                                          padding_mode='reflect', stride=1, device=x_t.device)
-
-            # A_copy = A.data.detach().clone()
             blur_kernel_A.weight.data = A.data
             blur_kernel_A.weight.requires_grad = True
-
-            # TODO: Tune other adam variables
-            # optimizer_A = th.optim.Adam(list(blur_kernel_A.parameters()), lr=eta, weight_decay=lambda_)
             optimizer_A = th.optim.Adam(list(blur_kernel_A.parameters()), lr=eta)
 
-            # Optimize A
-            loss_values = []
 
+            # Create logging value and schedule for number of steps
+            loss_values = []
             n_steps_scheduler = self.iteration_scheduler(t[0].item(),
                                                         self.num_timesteps,
                                                         max_iterations=n_steps)
 
+            # Optimize A
             for i in range(n_steps_scheduler):
                 # Minimize negative log likelihood of y | A_t
                 loss = self.blur_log_likelihood(y, t, x_t, blur_kernel_A, eps)
                 loss = loss + lambda_ * th.linalg.norm(blur_kernel_A.weight.view(-1), ord=1.0)
                 loss_values.append(loss.item())
-                if verbose:
-                    print(f"Timestep #{t}, likelihood: {loss}")
                 (-loss).backward()
 
                 # Clip gradients
@@ -538,16 +541,17 @@ class GaussianDiffusion:
                 # Perform gradient descent
                 optimizer_A.step()
                 optimizer_A.zero_grad()
+
+            # Log to weights and biases
             if wandb_log:
                 wandb.log({"Timestep": t[0].item(), "Log Likelihood": np.mean(loss_values),
                            "Log Likelihood average across batch": np.mean(loss_values) / batch_size})
-            print(f"Timestep #{t[0].item()}, average likelihood: {np.mean(loss_values)}")
 
             # A is detached from computational graph
             A_optim = blur_kernel_A.weight.data.clone()
             A.data = self.process_kernel(blur_kernel_A.weight.data)
 
-            return A_optim.detach()#.half()
+            return A_optim.detach()
 
     def _predict_xstart_from_xprev(self, x_t, t, xprev):
         assert x_t.shape == xprev.shape
@@ -583,14 +587,13 @@ class GaussianDiffusion:
         if blur_kernel is None:
             gradient = cond_fn(x, self._scale_timesteps(t), **model_kwargs)
         else:
-            # kernel_mu_convolve = self.convolve(blur_kernel, p_mean_var["mean"])
-            # kernel_mu_convolve = kernel_mu_convolve - y_t
+            # Convolve kernel with denoised variable
+            kernel_mu_convolve = self.convolve(blur_kernel, p_mean_var["mean"])
+            kernel_mu_convolve = kernel_mu_convolve - y_t
 
-            # # Analytical gradient wrt x_t
-            # gradient_xt = -2 * (self.transpose_convolve(blur_kernel, kernel_mu_convolve))
-
-            # # TODO: scale gradient_At
-            # gradient = gradient_xt * gradient_scaling
+            # Analytical gradient wrt x_t
+            gradient_xt = -2 * (self.transpose_convolve(blur_kernel, kernel_mu_convolve))
+            gradient = gradient_xt * gradient_scaling
 
             # Compute fidelity
             mu = p_mean_var["mean"].requires_grad_()
@@ -606,19 +609,8 @@ class GaussianDiffusion:
             gradient = gradient_auto * gradient_scaling
 
             mean_before_conditioning = p_mean_var["mean"].float()
-            if t[0].item() % 2 == 0:
-                sample_yt = ((p_mean_var["mean"]+ 1) * 127.5).clamp(0, 255).to(th.uint8)
-                sample_yt = sample_yt.permute(0, 2, 3, 1)
-                sample_yt = sample_yt.contiguous()
-                im_a_eps = Image.fromarray(sample_yt[0].cpu().numpy())
-                im_a_eps.save(f"logs/mean_{t[0].item()}_{x.size()[-1]}.png", mode='RGB')
 
-                sample_gradient = ((gradient_auto + 1) * 127.5).clamp(0, 255).to(th.uint8)
-                sample_gradient = sample_gradient.permute(0, 2, 3, 1)
-                sample_gradient = sample_gradient.contiguous()
-                im_a_eps = Image.fromarray(sample_gradient[0].cpu().numpy())
-                im_a_eps.save(f"logs/gradient_{t[0].item()}_{x.size()[-1]}.png", mode='RGB')
-
+        # Classifier guided diffusion
         new_mean = (
             p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float()
         )
@@ -648,94 +640,6 @@ class GaussianDiffusion:
         )
         return out
 
-    def get_gaussian_filter(self, kernel_size, sigma, mean=-1):
-        """
-        Given kernel size, output the blur filter
-        """
-        with th.no_grad():
-            # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
-            x_cord = th.arange(kernel_size)
-            x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
-            y_grid = x_grid.t()
-            xy_grid = th.stack([x_grid, y_grid], dim=-1)
-
-            if mean == -1:
-                mean = (kernel_size - 1)/2.
-            variance = sigma**2.
-
-            # Calculate the 2-dimensional gaussian kernel which is
-            # the product of two gaussian distributions for two different
-            # variables (in this case called x and y)
-            gaussian_kernel = (1./(2.*math.pi*variance)) *\
-                            th.exp(
-                                -th.sum((xy_grid - mean)**2., dim=-1) /\
-                                (2*variance)
-                            )
-            # Make sure sum of values in gaussian kernel equals 1.
-            gaussian_kernel = gaussian_kernel / th.sum(gaussian_kernel)
-
-            # Reshape to 2d depthwise convolutional weight
-            gaussian_kernel = gaussian_kernel.view(1, kernel_size, kernel_size)
-
-            # 3 = Num channels
-            gaussian_kernel = gaussian_kernel.repeat(3, 1, 1, 1)
-            gaussian_kernel = gaussian_kernel.cuda()
-
-            return gaussian_kernel
-
-    def get_uniform_filter(self, kernel_size):
-        """
-        Ground truth uniform kernel
-        """
-        with th.no_grad():
-            uniform_kernel = th.ones(1, kernel_size, kernel_size)
-            uniform_kernel = uniform_kernel / (kernel_size * kernel_size)
-            uniform_kernel = uniform_kernel.repeat(3, 1, 1, 1)
-            uniform_kernel = uniform_kernel.cuda()
-
-            return uniform_kernel
-
-    def get_multi_filter(self, kernel_size, sigma1, sigma2):
-        with th.no_grad():
-            mean1, mean2 = 3.0, 1.0
-            gaussian_kernel1 = self.get_gaussian_filter(kernel_size - 2, sigma1, mean1)
-            gaussian_kernel2 = self.get_gaussian_filter(kernel_size - 2, sigma2, mean2)
-
-            padding = gaussian_kernel2.shape[-1] - 1
-            multi_kernel = th.conv2d(gaussian_kernel2, gaussian_kernel1, padding=padding) [:1]
-            multi_kernel = multi_kernel.permute(1, 0, 2, 3)
-
-            return multi_kernel
-
-    def no_blur_filter(self, kernel_size):
-        with th.no_grad():
-            kernel = th.zeros((kernel_size, kernel_size), dtype=th.float32)
-            kernel[kernel_size // 2, kernel_size // 2] = 1.0
-
-            kernel_np = (kernel * 255).clamp(0, 255).to(th.uint8).cpu().numpy()
-
-            # Reshape to 2d depthwise convolutional weight
-            kernel = kernel.view(1, kernel_size, kernel_size)
-            kernel = kernel.repeat(3, 1, 1, 1)
-            kernel = kernel.cuda()
-            return kernel
-
-    def get_motion_filter(self, kernel_size):
-        with th.no_grad():
-            # 45 degrees, 135 degrees
-            motion_blur_data = th.tensor([[0.,0.,0.,0.00414365, 0.],
-                                            [0.01104972, 0.16298343, 0.02348066, 0., 0.00414365],
-                                            [0.00690608, 0.13259669, 0.19475138, 0.0980663,  0.],
-                                            [0., 0., 0.03453039, 0.18370166, 0.09530387],
-                                            [0., 0.00552486, 0.,0.01104972, 0.03176796]])
-            motion_blur_data = motion_blur_data.cuda()
-            motion_blur_data = motion_blur_data / th.sum(motion_blur_data)
-
-            motion_blur_data = motion_blur_data.view(1, kernel_size, kernel_size)
-            motion_blur_data = motion_blur_data.repeat(3, 1, 1, 1)
-            motion_blur_data = motion_blur_data.cuda()
-
-            return motion_blur_data
     def p_sample(
         self,
         model,
@@ -763,6 +667,11 @@ class GaussianDiffusion:
                         similarly to the model.
         :param model_kwargs: if not None, a dict of extra keyword arguments to
             pass to the model. This can be used for conditioning.
+        :param blur_kernel: if not None, blur kernel tensor getting predicted.
+            Otherwise, standard generation is done
+        :param corrupted_image: if not None, that image is deblurred.
+        :param gradient_scaling: classifer guidance scale
+        :param wandb_log: mlops using wandb
         :return: a dict containing the following keys:
                  - 'sample': a random sample from the model.
                  - 'pred_xstart': a prediction of x_0.
@@ -793,14 +702,9 @@ class GaussianDiffusion:
                     cond_fn, out, x, t, model_kwargs=model_kwargs
                 )
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
-        if t[0].item() == 0:
-            print(out["pred_At"])
-
         if wandb_log:
             # TODO Modify for Gaussian case
             kernel_size, batch_size = out["pred_At"].size()[-1], x.size()[0]
-            # ground_truth_kernel = self.get_gaussian_filter(kernel_size, sigma=15)
-            # ground_truth_kernel = self.get_multi_filter(kernel_size, sigma1=10, sigma2=10)
             ground_truth_kernel = self.get_motion_filter(kernel_size)
 
             psnr_val, ssim_val, lpips_val = self.metrics(self.convolve(out["pred_At"], out["pred_xstart"]), corrupted_image)
@@ -812,30 +716,6 @@ class GaussianDiffusion:
                        "SSIM Predicted Kernel over X start vs Observation": ssim_val,
                        "LPIPS Predicted Kernel over X start vs Observation": lpips_val,
                        "Mean cosine similarity": th.mean(cosine_kernels)})
-
-        if t[0].item() % 100 == 0:
-            mu = ((out["mean"] + 1) * 127.5).clamp(0,255).to(th.uint8)
-            mu = mu.permute(0,2,3,1)
-            x_prev = ((sample + 1) * 127.5).clamp(0,255).to(th.uint8)
-            x_prev = x_prev.permute(0,2,3,1)
-
-            if wandb_log:
-                plt.imshow(cosine_kernels.cpu().numpy()[0], cmap='viridis', interpolation='nearest')
-                plt.colorbar()
-                plt.savefig(f'imgs/cosine_similarity_kernels/cosine_similarity_kernels_{t[0].item()}.jpg')
-                plt.close()
-                print(out["pred_At"])
-
-                for i in range(batch_size):
-                    im = Image.fromarray(mu[i].cpu().numpy())
-                    im.save(f"imgs/means/mean_log_{t[0].item()}_{i}.jpg")
-
-                    im2 = Image.fromarray(x_prev[i].cpu().numpy())
-                    im2.save(f"imgs/samples/sample_log_{t[0].item()}_{i}.jpg")
-
-                    wandb.log({f"mean_log_{t[0].item()}_{i}": wandb.Image(im, caption="Diffusion Model mean for Timestep"),
-                            f"sample_log_{t[0].item()}_{i}": wandb.Image(im2, caption="Sample for Timestep")})
-
 
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
@@ -854,7 +734,8 @@ class GaussianDiffusion:
         kernel=None,
         corrupted_image=None,
         gradient_scaling=0,
-        wandb_log=True
+        wandb_log=True,
+        wandb_project_info=None
     ):
         """
         Generate samples from the model.
@@ -873,6 +754,12 @@ class GaussianDiffusion:
         :param device: if specified, the device to create the samples on.
                        If not specified, use a model parameter's device.
         :param progress: if True, show a tqdm progress bar.
+        :param adaptive_diffusion: if True, we are deblurring images with it
+        :param kernel: if not None, kernel predicted with diffusion model
+        :param corrupted_image: if not None, image corrupted with a blur kernel
+        :param gradient_scaling: scaling applied to the deblurring gradient
+        :param wandb_log: logging loss to weights and biases
+        :param wandb_project_info: wandb login info
         :return: a non-differentiable batch of samples.
         """
         if adaptive_diffusion:
@@ -882,12 +769,7 @@ class GaussianDiffusion:
         final = None
 
         if wandb_log:
-            WANDB_USER_NAME="sai-advaith"
-            WANDB_PROJECT_NAME="deblur_diffusion"
-            WANDB_RUN_NAME = "gaussian_blur_kernel_estimation_epochs_100_kernel_0_perturb_init_batch_size_8"
-
-            print(WANDB_RUN_NAME)
-
+            WANDB_USER_NAME, WANDB_PROJECT_NAME, WANDB_RUN_NAME = wandb_project_info
             wandb.init(project=WANDB_PROJECT_NAME, entity=WANDB_USER_NAME,
                        name=WANDB_RUN_NAME,
                        config={
